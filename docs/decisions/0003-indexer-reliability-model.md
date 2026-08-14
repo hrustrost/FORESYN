@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-14
+- Reorganization handling: Superseded by [ADR 0004](0004-deterministic-reorg-recovery.md)
 
 ## Context
 
@@ -13,9 +14,9 @@ The first contract event needed by product reads is the stable `MarketCreated(ui
 
 The Foresyn indexer is a one-shot historical catch-up command built inside the existing Rust modular monolith. It uses Alloy over HTTP and SQLx/PostgreSQL.
 
-On a fresh contract checkpoint it begins at `FORESYN_DEPLOYMENT_BLOCK`. On restart it first fetches the checkpoint block from the RPC and verifies that its hash is still canonical; a changed, missing, or above-head checkpoint stops with a structured error. After verification it begins at the block after the latest committed checkpoint. It computes a confirmation-aware safe head with checked subtraction and fetches only bounded block ranges, the configured contract address, and the exact `MarketCreated` signature topic.
+On a fresh contract checkpoint it begins at `FORESYN_DEPLOYMENT_BLOCK`. On restart it first fetches the checkpoint block from the RPC and verifies that its hash is still canonical. After verification it begins at the block after the latest committed checkpoint. It computes a confirmation-aware safe head with checked subtraction and fetches only bounded block ranges, the configured contract address, and the exact `MarketCreated` signature topic. ADR 0004 defines automatic recovery when checkpoint or parent verification detects a reorganization.
 
-Blocks are processed in ascending order. Before accepting each block after the first, its parent hash must equal the previously committed block hash. A mismatch returns a structured reorganization error and stops. Automatic rollback is not attempted in this milestone.
+Blocks are processed in ascending order. Before accepting each block after the first, its parent hash must equal the previously committed block hash. The original decision stopped on a mismatch; ADR 0004 supersedes that behavior with bounded common-ancestor recovery and canonical replay.
 
 Each accepted block has one database transaction containing:
 
@@ -44,10 +45,10 @@ Costs and limitations:
 
 - reads lag the chain by the configured confirmation count;
 - the command exits after catch-up rather than continuously following the head;
-- a detected reorganization or malformed matching log requires operator intervention;
+- a malformed matching log requires operator intervention;
 - only `MarketCreated` is decoded and projected;
 - future event projections require a historical backfill or redesigned raw ingestion/checkpointing;
-- retry/backoff, common-ancestor discovery, rollback/replay, WebSockets, and multi-event projections remain future work.
+- retry/backoff, WebSockets, and multi-event projections remain future work; common-ancestor recovery and rollback/replay are specified by ADR 0004.
 
 ## Alternatives considered
 
