@@ -1,6 +1,12 @@
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
 
+pub mod chain;
+pub mod config;
+pub mod contracts;
+pub mod db;
+pub mod indexer;
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,

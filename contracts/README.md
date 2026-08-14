@@ -42,7 +42,7 @@ forge test --gas-report
 
 This code is experimental and unaudited. Do not use it with real funds.
 
-## Events for the future indexer
+## Events for indexing
 
 `marketId` and the relevant `user` or `resolver` are indexed because those are expected filter keys. Outcomes and amounts remain event data to avoid spending topics on low-selectivity values.
 
@@ -52,4 +52,4 @@ This code is experimental and unaudited. Do not use it with real funds.
 - `MarketCancelled` includes cancellation reason, attempted outcome, and total pool.
 - `WinningsClaimed` and `RefundClaimed` include the transferred amount.
 
-These payloads let the planned Rust indexer update projections without making an RPC state read after every log.
+The Rust indexer's first vertical slice decodes `MarketCreated` directly from this stable ABI. The remaining events deliberately keep the fields needed for later projections without requiring an RPC state read after every log; their Rust handlers are not implemented yet.
