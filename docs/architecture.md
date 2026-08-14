@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This document defines the intended MVP boundaries. The prediction-market contract implements settlement, and the first Rust indexer slice persists confirmed canonical blocks, raw `MarketCreated` logs, a market projection, and a durable checkpoint. The health endpoint, frontend shell, and PostgreSQL Compose service also exist. Later event projections and recovery behavior remain explicitly deferred.
+This document defines the intended MVP boundaries. The prediction-market contract implements settlement, and the Rust indexer persists confirmed canonical blocks, raw `MarketCreated` logs, a market projection, and a durable checkpoint with deterministic reorganization recovery. The health endpoint, frontend shell, and PostgreSQL Compose service also exist. Later event projections remain explicitly deferred.
 
 ## System context
 
@@ -81,7 +81,9 @@ For each canonical block, one database transaction:
 
 Event identity is `(chain_id, transaction_hash, log_index)`. Block records retain `(chain_id, block_number, block_hash, parent_hash)`. The schema also enforces uniqueness of a log index within a block. Empty canonical blocks are stored and advance the checkpoint, so restarts do not rescan empty ranges. Replaying an identical block/log is a no-op; an identity collision with different data is an explicit error.
 
-On a parent mismatch, the indexer returns a structured `ReorgDetected` error with the block number and expected/actual parent hashes before accepting that block. Automated rollback, common-ancestor search, deletion, and replay are deliberately deferred. A matching-topic log with malformed ABI data similarly stops the block before any of its database state commits; unexpected contract addresses or signatures are ignored defensively.
+Checkpoint-hash and parent-hash mismatches enter the same bounded recovery path. Starting at the current stored checkpoint, the indexer compares the stored and RPC block hashes at each height while walking backward only as far as `FORESYN_DEPLOYMENT_BLOCK`. RPC discovery completes before any destructive SQL transaction begins. The first matching hash is the common ancestor; a missing stored/RPC block, invalid RPC block number, or lack of an ancestor is an explicit error and performs no rollback.
+
+After discovery, one PostgreSQL transaction locks the chain's checkpoint rows and ancestor block, deletes `indexed_blocks` strictly above the ancestor, relies on foreign-key cascades to remove orphaned raw events, market projections, and affected checkpoints, restores the configured contract checkpoint to the ancestor, and commits. The normal historical catch-up path then resumes at `ancestor + 1`. Only one recovery is attempted per command invocation, so a second concurrent reorganization fails explicitly instead of looping. A matching-topic log with malformed ABI data similarly stops its block before any database state commits; unexpected contract addresses or signatures are ignored defensively.
 
 Configuration, RPC, database, decode, and continuity failures remain distinct error categories. Tracing spans include run, batch, block, chain, contract, range, hash, and event-count context without logging database credentials or RPC URLs.
 
@@ -92,6 +94,10 @@ The first migration contains ABI-independent `indexed_blocks` and `blockchain_ev
 Solidity `uint256 marketId` is stored as exact `NUMERIC(78,0)`, not signed `BIGINT`; `uint64 deadline` uses exact `NUMERIC(20,0)` for the same reason. Addresses, hashes, and digests use length-constrained `BYTEA`. These choices preserve the complete ABI value domains while retaining queryable numeric identities and deadlines.
 
 The raw event table retains address, topics, and data for the `MarketCreated` logs selected by the current RPC filter, so that projection can be replayed after decoder changes. It is not a complete archive of all contract events; adding another event family requires the backfill or ingestion redesign described in ADR 0003.
+
+The current `indexed_blocks` primary key is chain-scoped, while checkpoints and projections are contract-scoped. A block rewind therefore cascades through all indexed data above the ancestor for that `chain_id`, not just one contract. This milestone supports one configured Foresyn contract per chain; multi-contract indexing on the same chain requires coordinated checkpoints/replay or a schema redesign. Rows belonging to another `chain_id` are not affected.
+
+The immutable `MarketCreated` projection can be recovered by deleting orphaned creation blocks and replaying canonical creation logs. Future mutable projections for pools, volume, positions, resolution, and claims must define deterministic rebuilding from canonical events before they are added.
 
 ## Why these technologies
 

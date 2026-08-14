@@ -3,13 +3,13 @@ use std::collections::BTreeMap;
 use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
 use thiserror::Error;
-use tracing::{Instrument, debug, info, info_span};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::{
     chain::{ChainBlock, ChainLog, ChainSource, RpcError},
     config::IndexerConfig,
     contracts::{DecodeError, decode_market_created, market_created_topic},
-    db::{Checkpoint, Database, DbError, MarketCreatedRecord},
+    db::{Checkpoint, Database, DbError, MarketCreatedRecord, RollbackSummary},
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -47,6 +47,13 @@ pub enum IndexerError {
         latest_block: u64,
     },
     #[error(
+        "stored checkpoint block {checkpoint_block} is below configured deployment block {deployment_block}"
+    )]
+    CheckpointBeforeDeployment {
+        checkpoint_block: u64,
+        deployment_block: u64,
+    },
+    #[error(
         "reorganization detected at stored checkpoint block {block_number}: expected hash {expected_hash}, canonical RPC hash {actual_hash}"
     )]
     CheckpointReorgDetected {
@@ -62,6 +69,23 @@ pub enum IndexerError {
         expected_parent: B256,
         actual_parent: B256,
     },
+    #[error("stored indexed block {block_number} is missing during common-ancestor search")]
+    StoredBlockMissingDuringAncestorSearch { block_number: u64 },
+    #[error("reorganization recovery cannot continue because the checkpoint disappeared")]
+    RecoveryCheckpointMissing,
+    #[error("RPC block {block_number} is missing during common-ancestor search")]
+    RpcBlockMissingDuringAncestorSearch { block_number: u64 },
+    #[error(
+        "no common ancestor exists between checkpoint block {checkpoint_block} and deployment block {deployment_block}"
+    )]
+    NoCommonAncestor {
+        checkpoint_block: u64,
+        deployment_block: u64,
+    },
+    #[error(
+        "another reorganization was detected at block {block_number} after one automatic recovery attempt"
+    )]
+    RecoveryLimitExceeded { block_number: u64 },
     #[error("RPC returned block {actual} while block {expected} was requested")]
     UnexpectedBlockNumber { expected: u64, actual: u64 },
     #[error(
@@ -102,6 +126,19 @@ pub trait BlockStore: Send + Sync {
         contract_address: Address,
     ) -> Result<Option<Checkpoint>, DbError>;
 
+    async fn indexed_block_hash(
+        &self,
+        chain_id: u64,
+        block_number: u64,
+    ) -> Result<Option<B256>, DbError>;
+
+    async fn rollback_to_ancestor(
+        &self,
+        chain_id: u64,
+        contract_address: Address,
+        ancestor: &Checkpoint,
+    ) -> Result<RollbackSummary, DbError>;
+
     async fn commit_block(
         &self,
         chain_id: u64,
@@ -119,6 +156,24 @@ impl BlockStore for Database {
         contract_address: Address,
     ) -> Result<Option<Checkpoint>, DbError> {
         self.checkpoint(chain_id, contract_address).await
+    }
+
+    async fn indexed_block_hash(
+        &self,
+        chain_id: u64,
+        block_number: u64,
+    ) -> Result<Option<B256>, DbError> {
+        self.indexed_block_hash(chain_id, block_number).await
+    }
+
+    async fn rollback_to_ancestor(
+        &self,
+        chain_id: u64,
+        contract_address: Address,
+        ancestor: &Checkpoint,
+    ) -> Result<RollbackSummary, DbError> {
+        self.rollback_to_ancestor(chain_id, contract_address, ancestor)
+            .await
     }
 
     async fn commit_block(
@@ -173,6 +228,37 @@ where
             });
         }
 
+        match self.run_catch_up_attempt().await {
+            Ok(summary) => Ok(summary),
+            Err(error) => {
+                let Some(reorg_block) = recoverable_reorg_block(&error) else {
+                    return Err(error);
+                };
+                warn!(
+                    block_number = reorg_block,
+                    error = %error,
+                    "reorganization detected"
+                );
+                let ancestor = self.recover_from_reorg().await?;
+                info!(
+                    ancestor_block = ancestor.block_number,
+                    ancestor_hash = %ancestor.block_hash,
+                    "canonical replay resumed"
+                );
+
+                match self.run_catch_up_attempt().await {
+                    Err(second_error) if recoverable_reorg_block(&second_error).is_some() => {
+                        let block_number = recoverable_reorg_block(&second_error)
+                            .expect("reorganization was matched above");
+                        Err(IndexerError::RecoveryLimitExceeded { block_number })
+                    }
+                    result => result,
+                }
+            }
+        }
+    }
+
+    async fn run_catch_up_attempt(&self) -> Result<RunSummary, IndexerError> {
         let latest_block = self.source.latest_block_number().await?;
         let safe_head = safe_head(latest_block, self.config.confirmations);
         let checkpoint = self
@@ -180,6 +266,7 @@ where
             .checkpoint(self.config.chain_id, self.config.contract_address)
             .await?;
         if let Some(checkpoint) = checkpoint.as_ref() {
+            self.validate_checkpoint_window(checkpoint)?;
             self.verify_checkpoint(checkpoint, latest_block).await?;
         }
         let mut next_block = match checkpoint.as_ref() {
@@ -236,6 +323,104 @@ where
             "indexer catch-up completed"
         );
         Ok(summary)
+    }
+
+    async fn recover_from_reorg(&self) -> Result<Checkpoint, IndexerError> {
+        let checkpoint = self
+            .store
+            .checkpoint(self.config.chain_id, self.config.contract_address)
+            .await?
+            .ok_or(IndexerError::RecoveryCheckpointMissing)?;
+        let ancestor = self.find_common_ancestor(&checkpoint).await?;
+
+        info!(
+            ancestor_block = ancestor.block_number,
+            ancestor_hash = %ancestor.block_hash,
+            "rollback started"
+        );
+        let rollback = self
+            .store
+            .rollback_to_ancestor(
+                self.config.chain_id,
+                self.config.contract_address,
+                &ancestor,
+            )
+            .await?;
+        info!(
+            ancestor_block = rollback.ancestor.block_number,
+            orphaned_blocks = rollback.orphaned_blocks,
+            orphaned_events = rollback.orphaned_events,
+            orphaned_market_projections = rollback.orphaned_market_projections,
+            "rollback committed"
+        );
+        Ok(ancestor)
+    }
+
+    async fn find_common_ancestor(
+        &self,
+        checkpoint: &Checkpoint,
+    ) -> Result<Checkpoint, IndexerError> {
+        self.validate_checkpoint_window(checkpoint)?;
+
+        info!(
+            checkpoint_block = checkpoint.block_number,
+            deployment_block = self.config.deployment_block,
+            "common ancestor search started"
+        );
+
+        for block_number in (self.config.deployment_block..=checkpoint.block_number).rev() {
+            let stored_hash = self
+                .store
+                .indexed_block_hash(self.config.chain_id, block_number)
+                .await?
+                .ok_or(IndexerError::StoredBlockMissingDuringAncestorSearch { block_number })?;
+            let canonical_block = match self.source.block_by_number(block_number).await {
+                Ok(block) => block,
+                Err(RpcError::BlockNotFound(_)) => {
+                    return Err(IndexerError::RpcBlockMissingDuringAncestorSearch { block_number });
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if canonical_block.number != block_number {
+                return Err(IndexerError::UnexpectedBlockNumber {
+                    expected: block_number,
+                    actual: canonical_block.number,
+                });
+            }
+
+            if stored_hash == canonical_block.hash {
+                info!(
+                    ancestor_block = block_number,
+                    ancestor_hash = %stored_hash,
+                    "common ancestor found"
+                );
+                return Ok(Checkpoint {
+                    block_number,
+                    block_hash: stored_hash,
+                });
+            }
+            debug!(
+                block_number,
+                stored_hash = %stored_hash,
+                canonical_hash = %canonical_block.hash,
+                "divergent block comparison"
+            );
+        }
+
+        Err(IndexerError::NoCommonAncestor {
+            checkpoint_block: checkpoint.block_number,
+            deployment_block: self.config.deployment_block,
+        })
+    }
+
+    fn validate_checkpoint_window(&self, checkpoint: &Checkpoint) -> Result<(), IndexerError> {
+        if checkpoint.block_number < self.config.deployment_block {
+            return Err(IndexerError::CheckpointBeforeDeployment {
+                checkpoint_block: checkpoint.block_number,
+                deployment_block: self.config.deployment_block,
+            });
+        }
+        Ok(())
     }
 
     async fn verify_checkpoint(
@@ -349,6 +534,15 @@ pub const fn safe_head(latest_block: u64, confirmations: u64) -> Option<u64> {
     latest_block.checked_sub(confirmations)
 }
 
+fn recoverable_reorg_block(error: &IndexerError) -> Option<u64> {
+    match error {
+        IndexerError::CheckpointReorgDetected { block_number, .. }
+        | IndexerError::ReorgDetected { block_number, .. }
+        | IndexerError::LogBlockHashMismatch { block_number, .. } => Some(*block_number),
+        _ => None,
+    }
+}
+
 fn group_logs(
     logs: Vec<ChainLog>,
     from_block: u64,
@@ -419,7 +613,7 @@ fn decode_block_logs(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, VecDeque},
         sync::{Arc, Mutex},
     };
 
@@ -435,7 +629,7 @@ mod tests {
         chain::{ChainBlock, ChainLog, ChainSource, RpcError},
         config::IndexerConfig,
         contracts::{MarketCreated, market_created_topic},
-        db::{Checkpoint, DbError, MarketCreatedRecord},
+        db::{Checkpoint, DbError, MarketCreatedRecord, RollbackSummary},
     };
 
     type RequestedRange = (u64, u64, Address, B256);
@@ -444,8 +638,8 @@ mod tests {
     struct FakeSource {
         chain_id: u64,
         latest: u64,
-        blocks: Arc<BTreeMap<u64, ChainBlock>>,
-        logs: Arc<Vec<ChainLog>>,
+        blocks: Arc<Mutex<BTreeMap<u64, VecDeque<ChainBlock>>>>,
+        logs: Arc<Mutex<VecDeque<Vec<ChainLog>>>>,
         requested_ranges: Arc<Mutex<Vec<RequestedRange>>>,
         requested_blocks: Arc<Mutex<Vec<u64>>>,
     }
@@ -462,10 +656,18 @@ mod tests {
 
         async fn block_by_number(&self, number: u64) -> Result<ChainBlock, RpcError> {
             self.requested_blocks.lock().unwrap().push(number);
-            self.blocks
-                .get(&number)
-                .cloned()
-                .ok_or(RpcError::BlockNotFound(number))
+            let mut blocks = self.blocks.lock().unwrap();
+            let responses = blocks
+                .get_mut(&number)
+                .ok_or(RpcError::BlockNotFound(number))?;
+            if responses.len() > 1 {
+                Ok(responses.pop_front().expect("response queue is not empty"))
+            } else {
+                responses
+                    .front()
+                    .cloned()
+                    .ok_or(RpcError::BlockNotFound(number))
+            }
         }
 
         async fn logs(
@@ -479,11 +681,20 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((from_block, to_block, address, topic0));
-            Ok(self
-                .logs
-                .iter()
+            let mut responses = self.logs.lock().unwrap();
+            let logs = if responses.len() > 1 {
+                responses
+                    .pop_front()
+                    .expect("log response queue is not empty")
+            } else {
+                responses
+                    .front()
+                    .cloned()
+                    .expect("log response queue is not empty")
+            };
+            Ok(logs
+                .into_iter()
                 .filter(|log| (from_block..=to_block).contains(&log.block_number))
-                .cloned()
                 .collect())
         }
     }
@@ -496,7 +707,9 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeStoreState {
         checkpoint: Option<Checkpoint>,
+        indexed_blocks: BTreeMap<u64, B256>,
         commits: Vec<(ChainBlock, Vec<MarketCreatedRecord>)>,
+        rollbacks: Vec<Checkpoint>,
     }
 
     #[async_trait]
@@ -507,6 +720,54 @@ mod tests {
             _contract_address: Address,
         ) -> Result<Option<Checkpoint>, DbError> {
             Ok(self.state.lock().unwrap().checkpoint.clone())
+        }
+
+        async fn indexed_block_hash(
+            &self,
+            _chain_id: u64,
+            block_number: u64,
+        ) -> Result<Option<B256>, DbError> {
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .indexed_blocks
+                .get(&block_number)
+                .copied())
+        }
+
+        async fn rollback_to_ancestor(
+            &self,
+            _chain_id: u64,
+            _contract_address: Address,
+            ancestor: &Checkpoint,
+        ) -> Result<RollbackSummary, DbError> {
+            let mut state = self.state.lock().unwrap();
+            let orphaned_blocks = state
+                .indexed_blocks
+                .keys()
+                .filter(|number| **number > ancestor.block_number)
+                .count() as u64;
+            let orphaned_events = state
+                .commits
+                .iter()
+                .filter(|(block, _)| block.number > ancestor.block_number)
+                .map(|(_, events)| events.len() as u64)
+                .sum();
+            state
+                .indexed_blocks
+                .retain(|number, _| *number <= ancestor.block_number);
+            state
+                .commits
+                .retain(|(block, _)| block.number <= ancestor.block_number);
+            state.checkpoint = Some(ancestor.clone());
+            state.rollbacks.push(ancestor.clone());
+            Ok(RollbackSummary {
+                ancestor: ancestor.clone(),
+                orphaned_blocks,
+                orphaned_events,
+                orphaned_market_projections: orphaned_events,
+            })
         }
 
         async fn commit_block(
@@ -521,6 +782,7 @@ mod tests {
                 block_number: block.number,
                 block_hash: block.hash,
             });
+            state.indexed_blocks.insert(block.number, block.hash);
             state.commits.push((block.clone(), events.to_vec()));
             Ok(())
         }
@@ -556,12 +818,62 @@ mod tests {
             .collect()
     }
 
+    fn chain_block(number: u64, hash: u8, parent_hash: u8) -> ChainBlock {
+        ChainBlock {
+            number,
+            hash: B256::repeat_byte(hash),
+            parent_hash: B256::repeat_byte(parent_hash),
+            timestamp: 1_900_000_000 + number,
+        }
+    }
+
+    fn seed_store(store: &FakeStore, local_blocks: &[ChainBlock]) {
+        let mut state = store.state.lock().unwrap();
+        for block in local_blocks {
+            state.indexed_blocks.insert(block.number, block.hash);
+            state.commits.push((block.clone(), Vec::new()));
+        }
+        let checkpoint = local_blocks.last().expect("at least one local block");
+        state.checkpoint = Some(Checkpoint {
+            block_number: checkpoint.number,
+            block_hash: checkpoint.hash,
+        });
+    }
+
     fn source(latest: u64, blocks: BTreeMap<u64, ChainBlock>, logs: Vec<ChainLog>) -> FakeSource {
+        scripted_source(
+            latest,
+            blocks
+                .into_iter()
+                .map(|(number, block)| (number, vec![block]))
+                .collect(),
+            logs,
+        )
+    }
+
+    fn scripted_source(
+        latest: u64,
+        blocks: BTreeMap<u64, Vec<ChainBlock>>,
+        logs: Vec<ChainLog>,
+    ) -> FakeSource {
+        scripted_source_with_logs(latest, blocks, vec![logs])
+    }
+
+    fn scripted_source_with_logs(
+        latest: u64,
+        blocks: BTreeMap<u64, Vec<ChainBlock>>,
+        log_responses: Vec<Vec<ChainLog>>,
+    ) -> FakeSource {
         FakeSource {
             chain_id: 31_337,
             latest,
-            blocks: Arc::new(blocks),
-            logs: Arc::new(logs),
+            blocks: Arc::new(Mutex::new(
+                blocks
+                    .into_iter()
+                    .map(|(number, blocks)| (number, blocks.into()))
+                    .collect(),
+            )),
+            logs: Arc::new(Mutex::new(log_responses.into())),
             requested_ranges: Arc::default(),
             requested_blocks: Arc::default(),
         }
@@ -662,52 +974,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_checkpoint_hash_is_detected_while_caught_up() {
-        let config = config(10, 10);
-        let mut chain_blocks = blocks(12, 12);
-        chain_blocks.get_mut(&12).unwrap().hash = B256::repeat_byte(0xee);
-        let source = source(12, chain_blocks, vec![]);
-        let requested_blocks = Arc::clone(&source.requested_blocks);
-        let requested_ranges = Arc::clone(&source.requested_ranges);
+    async fn shallow_checkpoint_reorg_recovers_and_replays_without_duplicates() {
+        let config = config(100, 10);
+        let ancestor = chain_block(100, 0xa0, 0x99);
+        let orphaned = chain_block(101, 0xb1, 0xa0);
+        let replacement = chain_block(101, 0xc1, 0xa0);
+        let log = market_log(&replacement, config.contract_address);
+        let source = source(
+            101,
+            [(100, ancestor.clone()), (101, replacement.clone())].into(),
+            vec![log],
+        );
         let store = FakeStore::default();
-        store.state.lock().unwrap().checkpoint = Some(Checkpoint {
-            block_number: 12,
-            block_hash: B256::with_last_byte(12),
-        });
+        seed_store(&store, &[ancestor.clone(), orphaned]);
         let state = Arc::clone(&store.state);
+        let indexer = Indexer::new(source, store, config);
 
-        let error = Indexer::new(source, store, config)
-            .run_once()
-            .await
-            .unwrap_err();
+        let summary = indexer.run_once().await.unwrap();
 
-        assert!(matches!(
-            error,
-            IndexerError::CheckpointReorgDetected {
-                block_number: 12,
-                expected_hash,
-                actual_hash,
-            } if expected_hash == B256::with_last_byte(12)
-                && actual_hash == B256::repeat_byte(0xee)
-        ));
-        assert_eq!(*requested_blocks.lock().unwrap(), vec![12]);
-        assert!(requested_ranges.lock().unwrap().is_empty());
-        assert!(state.lock().unwrap().commits.is_empty());
+        assert_eq!(summary.first_block, Some(101));
+        assert_eq!(summary.last_block, Some(101));
+        assert_eq!((summary.blocks_committed, summary.events_committed), (1, 1));
+        {
+            let state_after_recovery = state.lock().unwrap();
+            assert_eq!(
+                state_after_recovery.rollbacks,
+                vec![Checkpoint {
+                    block_number: 100,
+                    block_hash: ancestor.hash,
+                }]
+            );
+            assert_eq!(
+                state_after_recovery.checkpoint.as_ref().unwrap().block_hash,
+                replacement.hash
+            );
+            assert_eq!(
+                state_after_recovery
+                    .indexed_blocks
+                    .iter()
+                    .map(|(number, hash)| (*number, *hash))
+                    .collect::<Vec<_>>(),
+                vec![(100, ancestor.hash), (101, replacement.hash)]
+            );
+            assert_eq!(state_after_recovery.commits.last().unwrap().1.len(), 1);
+        }
+
+        let restart = indexer.run_once().await.unwrap();
+        assert_eq!(restart.blocks_committed, 0);
+        assert_eq!(state.lock().unwrap().commits.len(), 2);
     }
 
     #[tokio::test]
-    async fn changed_checkpoint_hash_is_detected_before_newer_blocks() {
-        let config = config(10, 10);
-        let mut chain_blocks = blocks(12, 14);
-        chain_blocks.get_mut(&12).unwrap().hash = B256::repeat_byte(0xee);
-        let source = source(14, chain_blocks, vec![]);
-        let requested_blocks = Arc::clone(&source.requested_blocks);
-        let requested_ranges = Arc::clone(&source.requested_ranges);
+    async fn deeper_checkpoint_reorg_walks_back_to_first_matching_block() {
+        let config = config(100, 10);
+        let ancestor = chain_block(100, 0xa0, 0x99);
+        let local = [
+            ancestor.clone(),
+            chain_block(101, 0xb1, 0xa0),
+            chain_block(102, 0xb2, 0xb1),
+            chain_block(103, 0xb3, 0xb2),
+        ];
+        let canonical = [
+            ancestor.clone(),
+            chain_block(101, 0xc1, 0xa0),
+            chain_block(102, 0xc2, 0xc1),
+            chain_block(103, 0xc3, 0xc2),
+        ];
+        let source = source(
+            103,
+            canonical
+                .iter()
+                .cloned()
+                .map(|block| (block.number, block))
+                .collect(),
+            vec![],
+        );
         let store = FakeStore::default();
-        store.state.lock().unwrap().checkpoint = Some(Checkpoint {
-            block_number: 12,
-            block_hash: B256::with_last_byte(12),
-        });
+        seed_store(&store, &local);
+        let state = Arc::clone(&store.state);
+
+        let summary = Indexer::new(source, store, config)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (summary.first_block, summary.last_block),
+            (Some(101), Some(103))
+        );
+        assert_eq!(summary.blocks_committed, 3);
+        let state = state.lock().unwrap();
+        assert_eq!(state.rollbacks[0].block_number, 100);
+        assert_eq!(state.indexed_blocks.get(&100), Some(&ancestor.hash));
+        assert_eq!(state.indexed_blocks.get(&101), Some(&canonical[1].hash));
+        assert_eq!(state.indexed_blocks.get(&102), Some(&canonical[2].hash));
+        assert_eq!(state.indexed_blocks.get(&103), Some(&canonical[3].hash));
+    }
+
+    #[tokio::test]
+    async fn no_common_ancestor_fails_without_destructive_mutation() {
+        let config = config(100, 10);
+        let local = [chain_block(100, 0xa0, 0x99), chain_block(101, 0xb1, 0xa0)];
+        let canonical = [chain_block(100, 0xc0, 0x98), chain_block(101, 0xc1, 0xc0)];
+        let source = source(
+            101,
+            canonical
+                .into_iter()
+                .map(|block| (block.number, block))
+                .collect(),
+            vec![],
+        );
+        let store = FakeStore::default();
+        seed_store(&store, &local);
         let state = Arc::clone(&store.state);
 
         let error = Indexer::new(source, store, config)
@@ -717,14 +1095,169 @@ mod tests {
 
         assert!(matches!(
             error,
-            IndexerError::CheckpointReorgDetected {
-                block_number: 12,
-                ..
+            IndexerError::NoCommonAncestor {
+                checkpoint_block: 101,
+                deployment_block: 100,
             }
         ));
-        assert_eq!(*requested_blocks.lock().unwrap(), vec![12]);
-        assert!(requested_ranges.lock().unwrap().is_empty());
-        assert!(state.lock().unwrap().commits.is_empty());
+        let state = state.lock().unwrap();
+        assert!(state.rollbacks.is_empty());
+        assert_eq!(state.checkpoint.as_ref().unwrap().block_hash, local[1].hash);
+        assert_eq!(state.indexed_blocks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_below_deployment_fails_before_scanning_or_mutation() {
+        let config = config(100, 10);
+        let local = chain_block(50, 0xb0, 0xaf);
+        let source = source(50, BTreeMap::new(), vec![]);
+        let requested_blocks = Arc::clone(&source.requested_blocks);
+        let store = FakeStore::default();
+        seed_store(&store, std::slice::from_ref(&local));
+        let state = Arc::clone(&store.state);
+
+        let error = Indexer::new(source, store, config)
+            .run_once()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IndexerError::CheckpointBeforeDeployment {
+                checkpoint_block: 50,
+                deployment_block: 100,
+            }
+        ));
+        assert!(requested_blocks.lock().unwrap().is_empty());
+        let state = state.lock().unwrap();
+        assert!(state.rollbacks.is_empty());
+        assert_eq!(
+            state.checkpoint,
+            Some(Checkpoint {
+                block_number: 50,
+                block_hash: local.hash,
+            })
+        );
+        assert_eq!(state.indexed_blocks, [(50, local.hash)].into());
+        assert_eq!(state.commits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_stored_block_during_ancestor_search_is_explicit() {
+        let config = config(100, 10);
+        let local_100 = chain_block(100, 0xa0, 0x99);
+        let local_102 = chain_block(102, 0xb2, 0xb1);
+        let canonical = [
+            local_100.clone(),
+            chain_block(101, 0xc1, 0xa0),
+            chain_block(102, 0xc2, 0xc1),
+        ];
+        let source = source(
+            102,
+            canonical
+                .into_iter()
+                .map(|block| (block.number, block))
+                .collect(),
+            vec![],
+        );
+        let store = FakeStore::default();
+        seed_store(&store, &[local_100, local_102]);
+        let state = Arc::clone(&store.state);
+
+        let error = Indexer::new(source, store, config)
+            .run_once()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IndexerError::StoredBlockMissingDuringAncestorSearch { block_number: 101 }
+        ));
+        assert!(state.lock().unwrap().rollbacks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_rpc_block_during_ancestor_search_is_explicit() {
+        let config = config(100, 10);
+        let local = [
+            chain_block(100, 0xa0, 0x99),
+            chain_block(101, 0xb1, 0xa0),
+            chain_block(102, 0xb2, 0xb1),
+        ];
+        let source = source(102, [(102, chain_block(102, 0xc2, 0xc1))].into(), vec![]);
+        let store = FakeStore::default();
+        seed_store(&store, &local);
+        let state = Arc::clone(&store.state);
+
+        let error = Indexer::new(source, store, config)
+            .run_once()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IndexerError::RpcBlockMissingDuringAncestorSearch { block_number: 101 }
+        ));
+        assert!(state.lock().unwrap().rollbacks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_rpc_block_number_during_ancestor_search_is_explicit() {
+        let config = config(100, 10);
+        let local = [
+            chain_block(100, 0xa0, 0x99),
+            chain_block(101, 0xb1, 0xa0),
+            chain_block(102, 0xb2, 0xb1),
+        ];
+        let invalid = chain_block(999, 0xc1, 0xa0);
+        let source = source(
+            102,
+            [(101, invalid), (102, chain_block(102, 0xc2, 0xc1))].into(),
+            vec![],
+        );
+        let store = FakeStore::default();
+        seed_store(&store, &local);
+        let state = Arc::clone(&store.state);
+
+        let error = Indexer::new(source, store, config)
+            .run_once()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IndexerError::UnexpectedBlockNumber {
+                expected: 101,
+                actual: 999,
+            }
+        ));
+        assert!(state.lock().unwrap().rollbacks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_reorg_in_one_run_hits_recovery_limit() {
+        let config = config(100, 10);
+        let ancestor = chain_block(100, 0xa0, 0x99);
+        let inconsistent = chain_block(101, 0xc1, 0xee);
+        let source = source(
+            101,
+            [(100, ancestor.clone()), (101, inconsistent)].into(),
+            vec![],
+        );
+        let store = FakeStore::default();
+        seed_store(&store, std::slice::from_ref(&ancestor));
+        let state = Arc::clone(&store.state);
+
+        let error = Indexer::new(source, store, config)
+            .run_once()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IndexerError::RecoveryLimitExceeded { block_number: 101 }
+        ));
+        assert_eq!(state.lock().unwrap().rollbacks.len(), 1);
     }
 
     #[tokio::test]
@@ -772,16 +1305,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_mismatch_stops_before_committing_block() {
-        let config = config(10, 10);
-        let mut chain_blocks = blocks(10, 11);
-        chain_blocks.get_mut(&11).unwrap().parent_hash = B256::repeat_byte(0xee);
-        let source = source(11, chain_blocks, vec![]);
+    async fn parent_mismatch_during_catch_up_recovers_without_operator_restart() {
+        let config = config(100, 10);
+        let ancestor = chain_block(100, 0xa0, 0x99);
+        let observed_before_reorg = chain_block(101, 0xb1, 0xa0);
+        let canonical_101 = chain_block(101, 0xc1, 0xa0);
+        let canonical_102 = chain_block(102, 0xc2, 0xc1);
+        let source = scripted_source(
+            102,
+            [
+                (100, vec![ancestor.clone()]),
+                (
+                    101,
+                    vec![observed_before_reorg.clone(), canonical_101.clone()],
+                ),
+                (102, vec![canonical_102.clone()]),
+            ]
+            .into(),
+            vec![],
+        );
         let store = FakeStore::default();
-        store.state.lock().unwrap().checkpoint = Some(Checkpoint {
-            block_number: 10,
-            block_hash: B256::with_last_byte(10),
-        });
+        seed_store(&store, std::slice::from_ref(&ancestor));
+        let state = Arc::clone(&store.state);
+
+        let summary = Indexer::new(source, store, config)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (summary.first_block, summary.last_block),
+            (Some(101), Some(102))
+        );
+        assert_eq!(summary.blocks_committed, 2);
+        let state = state.lock().unwrap();
+        assert_eq!(state.rollbacks[0].block_number, 100);
+        assert_eq!(state.indexed_blocks.get(&100), Some(&ancestor.hash));
+        assert_eq!(state.indexed_blocks.get(&101), Some(&canonical_101.hash));
+        assert_eq!(state.indexed_blocks.get(&102), Some(&canonical_102.hash));
+        assert!(
+            state
+                .commits
+                .iter()
+                .all(|(block, _)| block.hash != observed_before_reorg.hash)
+        );
+    }
+
+    #[tokio::test]
+    async fn log_block_hash_mismatch_recovers_with_canonical_logs_on_retry() {
+        let config = config(100, 10);
+        let ancestor = chain_block(100, 0xa0, 0x99);
+        let orphaned_101 = chain_block(101, 0xb1, 0xa0);
+        let canonical_101 = chain_block(101, 0xc1, 0xa0);
+        let orphaned_log = market_log(&orphaned_101, config.contract_address);
+        let canonical_log = market_log(&canonical_101, config.contract_address);
+        let source = scripted_source_with_logs(
+            101,
+            [
+                (100, vec![ancestor.clone()]),
+                (101, vec![canonical_101.clone()]),
+            ]
+            .into(),
+            vec![vec![orphaned_log], vec![canonical_log]],
+        );
+        let requested_ranges = Arc::clone(&source.requested_ranges);
+        let store = FakeStore::default();
+        seed_store(&store, std::slice::from_ref(&ancestor));
+        let state = Arc::clone(&store.state);
+        let indexer = Indexer::new(source, store, config);
+
+        let summary = indexer.run_once().await.unwrap();
+
+        assert_eq!((summary.blocks_committed, summary.events_committed), (1, 1));
+        assert_eq!(requested_ranges.lock().unwrap().len(), 2);
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.rollbacks.len(), 1);
+            assert_eq!(state.rollbacks[0].block_number, 100);
+            assert_eq!(state.commits.len(), 2);
+            assert_eq!(state.commits[1].0.hash, canonical_101.hash);
+            assert_eq!(state.commits[1].1.len(), 1);
+            assert_eq!(state.commits[1].1[0].log.block_hash, canonical_101.hash);
+            assert_eq!(
+                state.commits.iter().flat_map(|(_, events)| events).count(),
+                1
+            );
+        }
+
+        let restart = indexer.run_once().await.unwrap();
+        assert_eq!((restart.blocks_committed, restart.events_committed), (0, 0));
+        assert_eq!(state.lock().unwrap().commits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_log_block_hash_mismatch_hits_recovery_limit() {
+        let config = config(100, 10);
+        let ancestor = chain_block(100, 0xa0, 0x99);
+        let orphaned_101 = chain_block(101, 0xb1, 0xa0);
+        let canonical_101 = chain_block(101, 0xc1, 0xa0);
+        let orphaned_log = market_log(&orphaned_101, config.contract_address);
+        let source = scripted_source_with_logs(
+            101,
+            [(100, vec![ancestor.clone()]), (101, vec![canonical_101])].into(),
+            vec![vec![orphaned_log.clone()], vec![orphaned_log]],
+        );
+        let requested_ranges = Arc::clone(&source.requested_ranges);
+        let store = FakeStore::default();
+        seed_store(&store, std::slice::from_ref(&ancestor));
         let state = Arc::clone(&store.state);
 
         let error = Indexer::new(source, store, config)
@@ -791,12 +1421,13 @@ mod tests {
 
         assert!(matches!(
             error,
-            IndexerError::ReorgDetected {
-                block_number: 11,
-                ..
-            }
+            IndexerError::RecoveryLimitExceeded { block_number: 101 }
         ));
-        assert!(state.lock().unwrap().commits.is_empty());
+        assert_eq!(requested_ranges.lock().unwrap().len(), 2);
+        let state = state.lock().unwrap();
+        assert_eq!(state.rollbacks.len(), 1);
+        assert_eq!(state.commits.len(), 1);
+        assert!(state.commits[0].1.is_empty());
     }
 
     #[tokio::test]
