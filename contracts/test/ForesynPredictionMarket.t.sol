@@ -516,6 +516,51 @@ contract ForesynPredictionMarketTest is Test {
         assertEq(address(market).balance, 0);
     }
 
+    function test_marketsRemainAccountingIsolatedWhileSharingContractBalance() public {
+        uint256 marketA = _createMarket();
+        uint256 marketB = market.createMarket(deadline, resolver, keccak256("foresyn-market-b"));
+
+        _take(alice, marketA, ForesynPredictionMarket.Outcome.Yes, 2 ether);
+        _take(bob, marketA, ForesynPredictionMarket.Outcome.No, 1 ether);
+        _take(carol, marketB, ForesynPredictionMarket.Outcome.Yes, 4 ether);
+        _take(alice, marketB, ForesynPredictionMarket.Outcome.No, 6 ether);
+
+        assertEq(address(market).balance, 13 ether);
+
+        _resolve(marketA, ForesynPredictionMarket.Outcome.Yes);
+        assertEq(_claimPayout(alice, marketA), 3 ether);
+        assertEq(address(market).balance, 10 ether);
+
+        ForesynPredictionMarket.Market memory marketBBeforeSettlement = market.getMarket(marketB);
+        ForesynPredictionMarket.Position memory aliceMarketBPosition = market.getPosition(marketB, alice);
+        assertEq(uint8(marketBBeforeSettlement.status), uint8(ForesynPredictionMarket.MarketStatus.Open));
+        assertEq(marketBBeforeSettlement.yesPool, 4 ether);
+        assertEq(marketBBeforeSettlement.noPool, 6 ether);
+        assertEq(marketBBeforeSettlement.claimedWinningStake, 0);
+        assertEq(marketBBeforeSettlement.claimedAmount, 0);
+        assertEq(aliceMarketBPosition.noStake, 6 ether);
+        assertFalse(aliceMarketBPosition.claimed);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(ForesynPredictionMarket.MarketNotTerminal.selector, marketB));
+        market.claim(marketB);
+
+        _resolve(marketB, ForesynPredictionMarket.Outcome.No);
+        assertEq(_claimPayout(alice, marketB), 10 ether);
+        assertEq(address(market).balance, 0);
+
+        ForesynPredictionMarket.Market memory settledA = market.getMarket(marketA);
+        ForesynPredictionMarket.Market memory settledB = market.getMarket(marketB);
+        assertEq(settledA.yesPool, 2 ether);
+        assertEq(settledA.noPool, 1 ether);
+        assertEq(settledA.claimedWinningStake, 2 ether);
+        assertEq(settledA.claimedAmount, 3 ether);
+        assertEq(settledB.yesPool, 4 ether);
+        assertEq(settledB.noPool, 6 ether);
+        assertEq(settledB.claimedWinningStake, 6 ether);
+        assertEq(settledB.claimedAmount, 10 ether);
+    }
+
     function testFuzz_proportionalPayoutsRemainSolvent(
         uint128 aliceStakeSeed,
         uint128 bobStakeSeed,

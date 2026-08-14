@@ -43,7 +43,7 @@ See [the architecture document](docs/architecture.md), [ADR 0001](docs/decisions
 
 ```text
 backend/                 Rust/Axum API and versioned SQL migrations
-contracts/               Solidity/Foundry project placeholder
+contracts/               Implemented Solidity/Foundry settlement contract and tests
 docs/                    Architecture, ADRs, and design notes
 frontend/                React/TypeScript/Vite application
 docker-compose.yml       Local PostgreSQL only
