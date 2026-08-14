@@ -1,6 +1,6 @@
 # Proposed MVP settlement model
 
-Status: design proposal; no contract implementation exists yet.
+Status: implemented by `contracts/src/ForesynPredictionMarket.sol` and retained as the settlement specification.
 
 ## Goal
 
@@ -28,6 +28,8 @@ Resolved or Cancelled --claims--> remains terminal
 - Resolution is final in the MVP; the resolver trust assumption must be visible to users.
 - If the selected outcome has no stake, the market becomes `Cancelled` and all stakes are refundable. This prevents trapped funds and nonsensical division by zero.
 - A narrowly authorized emergency cancellation mechanism may be included, but its conditions and events must be explicit.
+
+The implemented prototype automatically cancels a zero-winning-pool resolution. It also permits the assigned resolver to cancel at/after the deadline when the real-world question cannot be resolved reliably. The owner has no separate cancellation power, and terminal markets cannot be changed.
 
 ## Payout
 
@@ -57,6 +59,8 @@ For a cancelled market, each address receives exactly its combined YES and NO st
 
 Claims use pull payments. Claim state and accounting are updated before transferring value, and the claim entry point is protected against reentrancy. An address can claim at most once per market.
 
+The owner may pause creation and new positions during an incident. Resolution and claims remain available while paused so already-deposited funds cannot be administratively frozen through the pause mechanism.
+
 ## Invariants
 
 Contract tests must demonstrate at least these properties:
@@ -84,4 +88,3 @@ Contract tests must demonstrate at least these properties:
 - governance or dispute arbitration.
 
 The next contract-design step should turn these rules into a small state machine and event/error interface before writing storage or transfer logic.
-

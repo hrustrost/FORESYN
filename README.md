@@ -6,7 +6,7 @@ This repository is intentionally not a Polymarket clone. The first version will 
 
 ## Current status
 
-Foresyn is in its **foundation and design** milestone.
+Foresyn has completed its **contract settlement** milestone.
 
 Implemented now:
 
@@ -14,11 +14,12 @@ Implemented now:
 - a React + TypeScript + Vite shell with no wallet or market behavior;
 - PostgreSQL-only Docker Compose configuration;
 - an ABI-independent migration for canonical indexed blocks and raw contract logs;
+- a Solidity/Foundry binary pari-mutuel prediction-market contract;
+- unit, fuzz, stateful invariant, reentrancy, and failed-receiver contract tests;
 - architecture, source-of-truth, and settlement-model documentation.
 
 Not implemented yet:
 
-- prediction-market contracts;
 - blockchain indexer or RPC integration;
 - market/query API endpoints beyond health;
 - database integration in the backend;
@@ -36,13 +37,13 @@ EVM prediction-market contract  -->  Rust / Alloy indexer (planned)
 
 The chain will be authoritative for market lifecycle, stakes, resolution, and claims. PostgreSQL will store replayable event history and query-optimized projections; it must never become a competing ledger. Descriptive metadata such as market titles and images remains off-chain.
 
-See [the architecture document](docs/architecture.md), [ADR 0001](docs/decisions/0001-on-chain-off-chain-boundary.md), and [the proposed settlement model](docs/settlement-model.md).
+See [the architecture document](docs/architecture.md), [ADR 0001](docs/decisions/0001-on-chain-off-chain-boundary.md), [ADR 0002](docs/decisions/0002-settlement-and-claim-model.md), and [the settlement model](docs/settlement-model.md).
 
 ## Repository layout
 
 ```text
 backend/                 Rust/Axum API and versioned SQL migrations
-contracts/               Solidity/Foundry project placeholder
+contracts/               Implemented Solidity/Foundry settlement contract and tests
 docs/                    Architecture, ADRs, and design notes
 frontend/                React/TypeScript/Vite application
 docker-compose.yml       Local PostgreSQL only
@@ -55,10 +56,12 @@ The backend and future indexer are intended to remain a modular Rust monolith un
 - **Rust, Tokio, and Axum** for explicit types, predictable performance, and a small HTTP surface.
 - **SQLx and PostgreSQL (planned backend integration)** for compile-time-aware SQL and transactional, auditable projections.
 - **Alloy (planned)** for EVM RPC, logs, and strongly typed event decoding.
-- **Solidity and Foundry (planned)** for contracts and invariant-oriented tests.
+- **Solidity and Foundry** for explicit contract state transitions and invariant-oriented tests.
 - **React, TypeScript, and Vite** for a small wallet-facing client.
 
 Dependencies are added when they are used. For example, SQLx and Alloy are not yet Rust dependencies because this milestone does not connect to the database or chain.
+
+The contract uses OpenZeppelin only for ownership, narrow emergency pausing, reentrancy protection, and full-precision payout arithmetic. Market state and settlement logic remain explicit in the Foresyn contract.
 
 ## Local development
 
@@ -110,9 +113,19 @@ cd frontend && npm run build
 docker compose config
 ```
 
+Run contract verification after initializing Git submodules:
+
+```bash
+git submodule update --init --recursive
+cd contracts
+forge fmt --check
+forge build
+forge test -vvv
+forge test --gas-report
+```
+
 The initial SQL migration is version-controlled under `backend/migrations`, but nothing runs it automatically yet. Migration execution will be added with the first SQLx-backed indexer slice.
 
 ## Security disclaimer
 
 Foresyn is experimental software and has not been audited. It must not be used with real funds. Do not commit private keys, seed phrases, RPC credentials, deployed secrets, or funded wallet details. Local secrets belong in `.env`, which is ignored by Git; `.env.example` contains placeholders only.
-

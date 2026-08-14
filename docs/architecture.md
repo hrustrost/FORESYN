@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This document defines the intended MVP boundaries. At the current foundation milestone, only the health endpoint, frontend shell, PostgreSQL Compose service, and initial indexing tables exist. Components marked as planned are not claims of completed functionality.
+This document defines the intended MVP boundaries. The prediction-market contract and Foundry tests now implement the on-chain settlement component. The health endpoint, frontend shell, PostgreSQL Compose service, and initial indexing tables also exist. Components marked as planned are not claims of completed functionality.
 
 ## System context
 
@@ -34,7 +34,7 @@ The complete decision and its consequences are recorded in [ADR 0001](decisions/
 
 ## On-chain state
 
-The first contract should store only information required to enforce settlement:
+The first contract stores only information required to enforce settlement:
 
 - a compact market identifier;
 - market deadline and lifecycle state;
@@ -50,7 +50,7 @@ Long text, images, tags, search fields, cached aggregates, and API presentation 
 
 The MVP uses native-chain currency and a pooled, pari-mutuel binary outcome. Winners receive their pro-rata share of the complete pool; a cancelled market refunds stakes. Integer rounding is handled by assigning the exact remaining wei to the final winning stake claimant, ensuring the contract never pays more than the pool and fully distributes it after all winners claim.
 
-The formula, lifecycle, edge cases, and invariants are specified in [the settlement model](settlement-model.md). No contract business logic should be written until those rules are reviewed.
+The formula, lifecycle, edge cases, and invariants are specified in [the settlement model](settlement-model.md) and [ADR 0002](decisions/0002-settlement-and-claim-model.md).
 
 ## Backend boundaries
 
@@ -107,4 +107,3 @@ The raw event table retains address, topics, and data so projections can be repl
 - Resolution requires explicit authorization; betting closes at the on-chain deadline.
 - Pausing, if included, must have a documented incident-response purpose and must not become an informal way to alter outcomes.
 - Contract and indexer tests must cover duplicate logs, restarts, reorgs, deadline boundaries, authorization, double claims, zero-winner outcomes, rounding, and solvency.
-
