@@ -7,9 +7,17 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
+alloy = { version = "0.15.11", default-features = false, features = ["provider-http", "reqwest-rustls-tls", "rpc-types-eth", "sol-types"] }
+async-trait = "0.1"
 axum = "0.8"
-serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# alloy-consensus 0.15.11 uses serde::__private::de::Content APIs that changed
+# incompatibly in Serde 1.0.222. Keep the compatible patch range until Alloy moves.
+serde = { version = ">=1.0.219, <1.0.222", features = ["derive"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["chrono", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring-native-roots"] }
+thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"

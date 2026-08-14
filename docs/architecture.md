@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This document defines the intended MVP boundaries. The prediction-market contract and Foundry tests now implement the on-chain settlement component. The health endpoint, frontend shell, PostgreSQL Compose service, and initial indexing tables also exist. Components marked as planned are not claims of completed functionality.
+This document defines the intended MVP boundaries. The prediction-market contract implements settlement, and the first Rust indexer slice persists confirmed canonical blocks, raw `MarketCreated` logs, a market projection, and a durable checkpoint. The health endpoint, frontend shell, and PostgreSQL Compose service also exist. Later event projections and recovery behavior remain explicitly deferred.
 
 ## System context
 
@@ -11,7 +11,7 @@ flowchart LR
     UI[React client] -->|REST; WebSocket later if justified| API[Rust / Axum]
     UI -->|signed transactions| CHAIN[EVM contract]
     API -->|queries| DB[(PostgreSQL)]
-    CHAIN -->|historical and new logs| IDX[Rust / Alloy indexer - planned]
+    CHAIN -->|confirmed historical logs| IDX[Rust / Alloy indexer]
     IDX -->|transactional events + projections| DB
 ```
 
@@ -67,29 +67,31 @@ Planned read endpoints are:
 
 These are query endpoints over projections; financial writes go through the user's wallet to the contract.
 
-## Indexer reliability model (planned)
+## Indexer reliability model
 
-The indexer must poll confirmed block ranges and perform historical catch-up before following the head. A subscription may reduce latency later, but it cannot replace catch-up because subscriptions lose events during downtime.
+The implemented command performs one polling catch-up and exits. It computes the safe head as `latest_block - confirmations` with underflow producing no work, starts at the configured contract deployment block on first use, and verifies the last committed contract-scoped checkpoint against the RPC's canonical block before resuming at the following block. It requests logs only for the configured contract and exact `MarketCreated` signature in bounded block ranges. A future continuous runner may invoke the same catch-up repeatedly; subscriptions are not part of this slice.
 
-For each batch, one database transaction will:
+For each canonical block, one database transaction:
 
-1. verify the stored parent block matches the canonical chain;
-2. insert canonical block identities;
-3. insert raw logs using a unique event identity;
-4. apply decoded events to projections idempotently;
-5. commit the block records and projections together.
+1. follows an RPC parent-hash check against the previously committed block;
+2. inserts the canonical block identity;
+3. inserts raw logs using a unique event identity;
+4. applies newly inserted `MarketCreated` events to the market projection;
+5. advances the checkpoint and commits all records together.
 
-Event identity is `(chain_id, transaction_hash, log_index)`. Block records retain `(chain_id, block_number, block_hash, parent_hash)`. The initial migration also enforces uniqueness of a log index within a block.
+Event identity is `(chain_id, transaction_hash, log_index)`. Block records retain `(chain_id, block_number, block_hash, parent_hash)`. The schema also enforces uniqueness of a log index within a block. Empty canonical blocks are stored and advance the checkpoint, so restarts do not rescan empty ranges. Replaying an identical block/log is a no-op; an identity collision with different data is an explicit error.
 
-On a hash mismatch, the indexer will walk backward to a common ancestor, delete orphaned blocks (cascading to raw events), rebuild affected projections from retained canonical events, and resume. Processing trails the chain head by a configurable confirmation count. RPC calls use bounded exponential backoff with jitter and observable terminal errors.
+On a parent mismatch, the indexer returns a structured `ReorgDetected` error with the block number and expected/actual parent hashes before accepting that block. Automated rollback, common-ancestor search, deletion, and replay are deliberately deferred. A matching-topic log with malformed ABI data similarly stops the block before any of its database state commits; unexpected contract addresses or signatures are ignored defensively.
 
-The indexer itself is not implemented in this milestone.
+Configuration, RPC, database, decode, and continuity failures remain distinct error categories. Tracing spans include run, batch, block, chain, contract, range, hash, and event-count context without logging database credentials or RPC URLs.
 
 ## PostgreSQL schema scope
 
-The first migration contains only `indexed_blocks` and `blockchain_events`. Their shapes are independent of the future contract ABI and directly support idempotency and reorganization handling. Market and position projection tables are deferred until contract events and identifiers are specified; adding them now would encode guesses as schema.
+The first migration contains ABI-independent `indexed_blocks` and `blockchain_events` tables. The second adds a contract-scoped checkpoint and the exact `MarketCreated` projection: chain, contract, market ID, resolver, creator, deadline, metadata digest, creation block, and creation transaction hash. Position and settlement projections remain deferred until their event handlers are implemented.
 
-The raw event table retains address, topics, and data so projections can be replayed after decoder changes. Decoded payloads may be cached later, but raw canonical input remains available.
+Solidity `uint256 marketId` is stored as exact `NUMERIC(78,0)`, not signed `BIGINT`; `uint64 deadline` uses exact `NUMERIC(20,0)` for the same reason. Addresses, hashes, and digests use length-constrained `BYTEA`. These choices preserve the complete ABI value domains while retaining queryable numeric identities and deadlines.
+
+The raw event table retains address, topics, and data for the `MarketCreated` logs selected by the current RPC filter, so that projection can be replayed after decoder changes. It is not a complete archive of all contract events; adding another event family requires the backfill or ingestion redesign described in ADR 0003.
 
 ## Why these technologies
 
