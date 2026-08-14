@@ -1,0 +1,28 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Rust
+target/
+
+# Node / Vite
+frontend/node_modules/
+frontend/dist/
+frontend/*.local
+
+# Foundry
+contracts/cache/
+contracts/out/
+contracts/broadcast/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
