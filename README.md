@@ -1,6 +1,7 @@
 # FORESYN
 
 ### EVM Prediction Market & Rust Blockchain Infrastructure
+[![CI](https://github.com/hrustrost/FORESYN/actions/workflows/ci.yml/badge.svg)](https://github.com/hrustrost/FORESYN/actions/workflows/ci.yml)
 
 FORESYN is an EVM prediction-market prototype built to explore reliable blockchain backend architecture beyond basic event listening.
 
