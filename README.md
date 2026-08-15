@@ -119,7 +119,7 @@ The contract uses OpenZeppelin only for ownership, narrow emergency pausing, ree
 
 Prerequisites:
 
-- Rust 1.85 or newer;
+- Rust 1.88 or newer;
 - Node.js 20.19+ or 22.12+;
 - Docker with Compose;
 - Foundry for contract work and the optional Anvil smoke test.
