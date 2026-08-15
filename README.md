@@ -9,6 +9,42 @@ The system combines Solidity smart contracts with a Rust/Alloy blockchain indexe
 
 The blockchain remains the financial source of truth. PostgreSQL stores replayable, query-optimized projections that can be deterministically rebuilt from canonical blockchain history.
 
+## Live Demo
+
+- **Frontend:** https://foresyn-seven.vercel.app
+- **Backend / health:** https://foresyn.onrender.com/health
+- **Network:** Base Sepolia testnet (`chainId` 84532)
+- **Contract:** [`0xa60d5Da44F32FeC40f26945a323fa4d98790312a`](https://sepolia.basescan.org/address/0xa60d5Da44F32FeC40f26945a323fa4d98790312a)
+- **Deployment block:** `45525292`
+
+This deployment is testnet-only. The Render free tier may cold-start after inactivity, so the first backend request can take longer than subsequent requests.
+
+## Public Deployment Architecture
+
+### Projected read path
+
+```mermaid
+flowchart LR
+    B[Browser] --> V[Vercel / React]
+    V --> A[Axum REST API / Render]
+    A --> P[(Supabase PostgreSQL)]
+```
+
+### Wallet-signed write and indexing path
+
+```mermaid
+flowchart LR
+    R[React] --> M[MetaMask / EIP-1193]
+    M -->|user-signed takePosition| C[Base Sepolia Solidity contract]
+    C --> E[Confirmed EVM events]
+    E --> I[Rust / Alloy indexer on Render]
+    I --> P[(Supabase PostgreSQL)]
+    P --> A[Axum API]
+    A --> R
+```
+
+The React frontend is hosted on Vercel, while the Solidity contract is deployed to Base Sepolia. The Rust Axum API and watch-mode Alloy indexer run on Render, and Supabase provides PostgreSQL for durable checkpoints and read projections. The API and indexer share one Render service for this portfolio/free-tier deployment; a production deployment would normally separate them so each can scale, restart, and be operated independently.
+
 ## Architecture Overview
 
 ```mermaid
@@ -48,6 +84,7 @@ The indexer maintains durable checkpoints, validates canonical chain state and d
 - deterministic reorg detection, rollback and canonical replay
 - transactional PostgreSQL projections with SQLx
 - idempotent event processing and durable checkpoints
+- shutdown-aware exponential backoff for transient RPC failures
 - direct MetaMask / EIP-1193 transaction signing
 - exact `uint256` handling without JavaScript floating-point conversion
 - Foundry unit, fuzz and stateful invariant testing
@@ -168,8 +205,17 @@ algorithm every two seconds with:
 cargo run --locked -p foresyn-backend --bin indexer -- --watch
 ```
 
-`--poll-interval-ms 2000` optionally changes the watch interval. A fatal RPC,
-database, decode, or invariant error terminates the process instead of being hidden.
+`--poll-interval-ms 2000` optionally changes the watch interval.
+
+Watch-mode failure behavior is deliberately narrow:
+
+- only `IndexerError::Rpc` is retried;
+- retry delays use exponential backoff of 1, 2, 4, 8, and 16 seconds, capped at 30 seconds;
+- a successful `run_once` resets the backoff to one second;
+- shutdown interrupts the retry sleep promptly;
+- one-shot mode remains fail-fast, including for RPC errors; and
+- database, decode, chain-consistency, invariant, and reorg-recovery errors remain fatal.
+
 `--full-reindex --watch` performs the explicit destructive reindex once during safe
 startup, then enters normal watch iterations; it never repeats the reindex.
 
