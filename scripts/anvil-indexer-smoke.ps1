@@ -45,7 +45,7 @@ try {
     }
 
     & psql $env:TEST_DATABASE_URL -v ON_ERROR_STOP=1 -c `
-        'TRUNCATE markets, indexer_checkpoints, blockchain_events, indexed_blocks CASCADE' | Out-Null
+        'TRUNCATE indexer_contract_coverage, market_positions, market_states, markets, indexer_checkpoints, blockchain_events, indexed_blocks CASCADE' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to reset the disposable smoke-test database.' }
 
     Push-Location (Join-Path $PSScriptRoot '..\contracts')
