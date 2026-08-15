@@ -1,8 +1,56 @@
-# Foresyn
+# FORESYN
 
-Foresyn is a small, production-minded decentralized prediction-market prototype. It is a portfolio project focused on the engineering concerns behind Web3 systems: explicit trust boundaries, safe settlement, restartable blockchain indexing, queryable projections, and honest failure recovery.
+### EVM Prediction Market & Rust Blockchain Infrastructure
 
-This repository is intentionally not a Polymarket clone. The first version will use one simple binary market and a deterministic pooled settlement model. It will not include an order book, custom token, bridge, DAO, or sophisticated oracle network.
+FORESYN is an EVM prediction-market prototype built to explore reliable blockchain backend architecture beyond basic event listening.
+
+The system combines Solidity smart contracts with a Rust/Alloy blockchain indexer, deterministic EVM reorganization recovery, PostgreSQL projections, an Axum REST API and a React/MetaMask Web3 client.
+
+The blockchain remains the financial source of truth. PostgreSQL stores replayable, query-optimized projections that can be deterministically rebuilt from canonical blockchain history.
+
+## Architecture Overview
+
+```mermaid
+flowchart LR
+    U[React Client]
+    W[MetaMask / EIP-1193]
+    C[Solidity Contract]
+    I[Rust / Alloy Indexer]
+    P[(PostgreSQL)]
+    A[Axum REST API]
+
+    U -->|sign transaction| W
+    W -->|takePosition| C
+    C -->|EVM events| I
+    I --> P
+    P --> A
+    A --> U
+```
+
+### Write path
+
+**React → MetaMask → user signature → Solidity → EVM**
+
+Financial transactions are signed directly by the user's wallet. The backend never receives or manages user private keys.
+
+### Read path
+
+**EVM events → Rust/Alloy indexer → PostgreSQL → Axum REST API → React**
+
+The indexer maintains durable checkpoints, validates canonical chain state and deterministically recovers from EVM reorganizations.
+
+## Engineering Highlights
+
+- Solidity binary prediction-market contract with pull-based settlement
+- Rust, Tokio and Axum backend
+- Alloy-based EVM event indexing
+- deterministic reorg detection, rollback and canonical replay
+- transactional PostgreSQL projections with SQLx
+- idempotent event processing and durable checkpoints
+- direct MetaMask / EIP-1193 transaction signing
+- exact `uint256` handling without JavaScript floating-point conversion
+- Foundry unit, fuzz and stateful invariant testing
+- PostgreSQL integration and Anvil end-to-end smoke testing
 
 ## Current status
 
