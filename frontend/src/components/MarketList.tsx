@@ -4,12 +4,14 @@ import { MarketCard } from './MarketCard'
 interface MarketListProps {
   markets: Market[]
   selectedMarketId: string | null
+  disabled?: boolean
   onSelect: (marketId: string) => void
 }
 
 export function MarketList({
   markets,
   selectedMarketId,
+  disabled = false,
   onSelect,
 }: MarketListProps) {
   return (
@@ -28,6 +30,7 @@ export function MarketList({
             key={market.market_id}
             market={market}
             selected={market.market_id === selectedMarketId}
+            disabled={disabled}
             onSelect={onSelect}
           />
         ))}

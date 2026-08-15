@@ -1,3 +1,5 @@
+import type { ReactNode } from 'react'
+
 import type { Market, Position } from '../api'
 import { formatDeadline, formatWei, shortenAddress } from '../format'
 import { PositionsList } from './PositionsList'
@@ -5,9 +7,10 @@ import { PositionsList } from './PositionsList'
 interface MarketDetailProps {
   market: Market
   positions: Position[]
+  actions?: ReactNode
 }
 
-export function MarketDetail({ market, positions }: MarketDetailProps) {
+export function MarketDetail({ market, positions, actions }: MarketDetailProps) {
   return (
     <article className="market-detail" aria-labelledby="detail-heading">
       <header className="market-detail__header">
@@ -58,6 +61,8 @@ export function MarketDetail({ market, positions }: MarketDetailProps) {
         <span>Metadata digest</span>
         <code title={market.metadata_digest}>{market.metadata_digest}</code>
       </div>
+
+      {actions}
 
       <section className="positions" aria-labelledby="positions-heading">
         <div className="positions__heading">
