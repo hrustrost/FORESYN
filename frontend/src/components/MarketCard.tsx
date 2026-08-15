@@ -4,16 +4,18 @@ import { formatDeadline, formatWei, shortenAddress } from '../format'
 interface MarketCardProps {
   market: Market
   selected: boolean
+  disabled?: boolean
   onSelect: (marketId: string) => void
 }
 
-export function MarketCard({ market, selected, onSelect }: MarketCardProps) {
+export function MarketCard({ market, selected, disabled = false, onSelect }: MarketCardProps) {
   return (
     <button
       className={`market-card${selected ? ' market-card--selected' : ''}`}
       type="button"
       onClick={() => onSelect(market.market_id)}
       aria-pressed={selected}
+      disabled={disabled}
     >
       <span className="market-card__topline">
         <span className="market-number">Market #{market.market_id}</span>
