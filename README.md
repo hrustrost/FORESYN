@@ -6,22 +6,22 @@ This repository is intentionally not a Polymarket clone. The first version will 
 
 ## Current status
 
-Foresyn now has a deterministic **contract-to-database position projection** slice.
+Foresyn now has a deterministic **contract-to-database-to-REST read path**.
 
 Implemented now:
 
-- a Rust workspace with a minimal Axum `GET /health` service;
+- a Rust workspace with an Axum health endpoint and scoped market/position read API;
 - a React + TypeScript + Vite shell with no wallet or market behavior;
 - PostgreSQL-only Docker Compose configuration;
 - SQLx migrations for canonical blocks, raw `MarketCreated`/`PositionTaken` logs, durable checkpoints, immutable markets, mutable pool state, and per-user positions;
 - a one-shot Rust/Alloy indexer with confirmed historical catch-up, bounded multi-event log queries, typed event decoding, restart-safe checkpoints, and deterministic reorganization rollback/rebuild/replay;
+- PostgreSQL-backed `GET /api/markets`, `GET /api/markets/:market_id`, and `GET /api/markets/:market_id/positions` routes;
 - a Solidity/Foundry binary pari-mutuel prediction-market contract;
 - Rust tests for configuration, decoding, ordering, idempotency, restart, rollback, malformed logs, filtering, and continuity, plus contract unit, fuzz, stateful invariant, reentrancy, and failed-receiver tests;
 - architecture, source-of-truth, and settlement-model documentation.
 
 Not implemented yet:
 
-- market/query API endpoints beyond health;
 - indexing of resolution, cancellation, and claim events;
 - continuous polling or WebSocket subscriptions;
 - wallet integration or transaction submission.
@@ -94,9 +94,14 @@ Run the backend:
 ```bash
 cargo run -p foresyn-backend
 curl http://localhost:8080/health
+curl http://localhost:8080/api/markets
 ```
 
-The response is `{"status":"ok"}`. The current health check reports process health only; it does not claim database or chain readiness.
+The API requires only `DATABASE_URL`, `EVM_CHAIN_ID`, and `FORESYN_CONTRACT_ADDRESS`; it does not require an RPC URL. `FORESYN_BIND_ADDRESS` defaults to `127.0.0.1:8080`, and `FORESYN_CORS_ORIGIN` defaults to the local Vite origin `http://localhost:5173`. CORS permits that explicit origin for read requests and does not enable credentials.
+
+`GET /health` returns `{"status":"ok"}` and reports process health only. The read routes query PostgreSQL projections scoped to the configured chain and contract. They never query RPC per request and never authorize financial writes. Markets are newest-first and support `?limit=`/`?offset=` with a default limit of 20 and maximum of 100.
+
+All chain-derived numeric response fields are decimal strings, preserving values beyond JavaScript's safe integer range. Addresses and metadata digests are lowercase, `0x`-prefixed hex. Resolution, cancellation, and claim events are not indexed, so the API intentionally exposes no lifecycle status.
 
 Run one confirmed historical catch-up after filling every indexer value in `.env`:
 
@@ -145,13 +150,14 @@ forge test --gas-report
 
 Database integration tests run when `TEST_DATABASE_URL` points to a disposable PostgreSQL database; otherwise the database-specific test prints a skip reason. The test truncates Foresyn indexing tables, so never point it at shared or production data.
 
-The end-to-end smoke helpers also require Foundry commands on `PATH`. The baseline verifies create/index/restart, the reorg smoke verifies immutable market replacement, and the position smoke verifies real `PositionTaken` pool/user projections across snapshot/revert recovery and restart:
+The end-to-end smoke helpers also require Foundry commands on `PATH`. The baseline verifies create/index/restart, the reorg smoke verifies immutable market replacement, the position smoke verifies mutable recovery, and the API smoke verifies the complete event-to-JSON read path:
 
 ```powershell
 $env:TEST_DATABASE_URL = 'postgres://foresyn:foresyn_dev_only@localhost:5432/foresyn'
 .\scripts\anvil-indexer-smoke.ps1
 .\scripts\anvil-reorg-smoke.ps1
 .\scripts\anvil-position-reorg-smoke.ps1
+.\scripts\api-read-smoke.ps1
 ```
 
 ## Security disclaimer

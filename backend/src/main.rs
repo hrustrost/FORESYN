@@ -1,22 +1,37 @@
-use std::env;
-
+use foresyn_backend::{
+    api::{ApiState, router},
+    config::ApiConfig,
+    read_repository::PostgresMarketReader,
+};
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-
-const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8080";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
-    let bind_address =
-        env::var("FORESYN_BIND_ADDRESS").unwrap_or_else(|_| DEFAULT_BIND_ADDRESS.to_owned());
-    let listener = TcpListener::bind(&bind_address).await?;
+    let config = ApiConfig::from_env()?;
+    let reader = PostgresMarketReader::connect(
+        &config.database_url,
+        config.chain_id,
+        config.contract_address,
+    )
+    .await?;
+    let application = router(
+        ApiState::new(std::sync::Arc::new(reader)),
+        &config.cors_origin,
+    )?;
+    let listener = TcpListener::bind(config.bind_address).await?;
 
-    info!(address = %bind_address, "backend listening");
+    info!(
+        address = %config.bind_address,
+        chain_id = config.chain_id,
+        contract_address = %config.contract_address,
+        "backend listening"
+    );
 
-    axum::serve(listener, foresyn_backend::router())
+    axum::serve(listener, application)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

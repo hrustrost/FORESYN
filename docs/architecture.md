@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This document defines the intended MVP boundaries. The prediction-market contract implements settlement, and the Rust indexer persists confirmed canonical blocks, raw `MarketCreated` and `PositionTaken` logs, immutable market metadata, mutable pool and user-position projections, and a durable checkpoint with deterministic reorganization recovery. The health endpoint, frontend shell, and PostgreSQL Compose service also exist. Settlement-event projections and product APIs remain explicitly deferred.
+This document defines the intended MVP boundaries. The prediction-market contract implements settlement, the Rust indexer maintains canonical PostgreSQL projections, and a small Axum REST API exposes scoped market and position reads for the frontend. Settlement-event projections and financial API writes remain explicitly deferred.
 
 ## System context
 
@@ -54,18 +54,33 @@ The formula, lifecycle, edge cases, and invariants are specified in [the settlem
 
 ## Backend boundaries
 
-The Axum layer owns HTTP concerns: routing, input validation, response mapping, and request tracing. Domain modules will own market/query concepts without depending on HTTP types. Repository modules will own SQLx queries and transactions.
+The Axum layer owns routing, path/query validation, response DTOs, stable client errors, CORS, and server-side error tracing. The read repository owns SQLx queries and conversion from PostgreSQL values. Handlers contain no SQL and internal SQLx rows are never serialized directly.
 
-Only `GET /health` exists now. It deliberately reports process health, not dependency readiness. Database and chain readiness can be added once those dependencies are real.
+The implemented routes are:
 
-Planned read endpoints are:
+- `GET /health`
+- `GET /api/markets?limit=&offset=`
+- `GET /api/markets/:market_id`
+- `GET /api/markets/:market_id/positions`
 
-- `GET /markets`
-- `GET /markets/:id`
-- `GET /markets/:id/activity`
-- `GET /users/:address/positions`
+Every repository predicate includes the configured `chain_id` and `contract_address`. The API configuration reuses `DATABASE_URL`, `EVM_CHAIN_ID`, and `FORESYN_CONTRACT_ADDRESS` but does not require `EVM_RPC_URL` or indexer-only settings. Requests read PostgreSQL only; there is no per-request RPC fallback.
 
-These are query endpoints over projections; financial writes go through the user's wallet to the contract.
+The read path is:
+
+`EVM transaction -> Solidity event -> Rust indexer -> PostgreSQL projection -> Axum read API -> frontend`
+
+The authority boundary remains:
+
+- blockchain = financial source of truth;
+- indexer = synchronization and deterministic repair layer;
+- PostgreSQL = query-optimized read model;
+- API = read interface over that model.
+
+Financial writes bypass this API and go from the user's wallet to the contract. PostgreSQL and the REST responses are not settlement authority.
+
+The market list left-joins `market_states`, so a newly created market with no positions returns zero pools. Pool and stake totals are calculated with PostgreSQL exact numerics. Solidity `uint256`, `uint64` deadlines, and block provenance are serialized as decimal strings to avoid JavaScript precision loss. Addresses and digests are explicit lowercase fixed-width hex strings rather than JSON byte arrays.
+
+Resolution, cancellation, and claim events are not projected. Consequently the API does not invent an Open, Resolved, or Cancelled status.
 
 ## Indexer reliability model
 
