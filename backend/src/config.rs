@@ -1,10 +1,76 @@
-use std::{collections::HashMap, env, fmt};
+use std::{collections::HashMap, env, fmt, net::SocketAddr};
 
 use alloy::primitives::Address;
 use thiserror::Error;
 use url::Url;
 
 const MAX_BATCH_SIZE: u64 = 10_000;
+const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8080";
+const DEFAULT_CORS_ORIGIN: &str = "http://localhost:5173";
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiConfig {
+    pub database_url: String,
+    pub chain_id: u64,
+    pub contract_address: Address,
+    pub bind_address: SocketAddr,
+    pub cors_origin: String,
+}
+
+impl fmt::Debug for ApiConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApiConfig")
+            .field("database_url", &"<redacted>")
+            .field("chain_id", &self.chain_id)
+            .field("contract_address", &self.contract_address)
+            .field("bind_address", &self.bind_address)
+            .field("cors_origin", &self.cors_origin)
+            .finish()
+    }
+}
+
+impl ApiConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_values(env::vars().collect())
+    }
+
+    fn from_values(values: HashMap<String, String>) -> Result<Self, ConfigError> {
+        let database_url = database_url(&values)?;
+        let chain_id = chain_id(&values)?;
+        let contract_address = contract_address(&values)?;
+        let bind_address_raw = values
+            .get("FORESYN_BIND_ADDRESS")
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_BIND_ADDRESS);
+        let bind_address =
+            bind_address_raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidSocketAddress {
+                    name: "FORESYN_BIND_ADDRESS",
+                })?;
+        let cors_origin = values
+            .get("FORESYN_CORS_ORIGIN")
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_CORS_ORIGIN.to_owned());
+        let cors_url = parse_url("FORESYN_CORS_ORIGIN", &cors_origin)?;
+        if !matches!(cors_url.scheme(), "http" | "https") {
+            return Err(ConfigError::UnsupportedScheme {
+                name: "FORESYN_CORS_ORIGIN",
+                scheme: cors_url.scheme().to_owned(),
+            });
+        }
+
+        Ok(Self {
+            database_url,
+            chain_id,
+            contract_address,
+            bind_address,
+            cors_origin,
+        })
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct IndexerConfig {
@@ -38,14 +104,7 @@ impl IndexerConfig {
     }
 
     fn from_values(values: HashMap<String, String>) -> Result<Self, ConfigError> {
-        let database_url = required(&values, "DATABASE_URL")?;
-        let database_url_parsed = parse_url("DATABASE_URL", &database_url)?;
-        if !matches!(database_url_parsed.scheme(), "postgres" | "postgresql") {
-            return Err(ConfigError::UnsupportedScheme {
-                name: "DATABASE_URL",
-                scheme: database_url_parsed.scheme().to_owned(),
-            });
-        }
+        let database_url = database_url(&values)?;
 
         let rpc_url_raw = required(&values, "EVM_RPC_URL")?;
         let rpc_url = parse_url("EVM_RPC_URL", &rpc_url_raw)?;
@@ -56,22 +115,8 @@ impl IndexerConfig {
             });
         }
 
-        let chain_id = parse_u64(&values, "EVM_CHAIN_ID")?;
-        ensure_positive("EVM_CHAIN_ID", chain_id)?;
-        ensure_db_bigint("EVM_CHAIN_ID", chain_id)?;
-
-        let contract_address_raw = required(&values, "FORESYN_CONTRACT_ADDRESS")?;
-        let contract_address =
-            contract_address_raw
-                .parse()
-                .map_err(|_| ConfigError::InvalidAddress {
-                    name: "FORESYN_CONTRACT_ADDRESS",
-                })?;
-        if contract_address == Address::ZERO {
-            return Err(ConfigError::ZeroAddress {
-                name: "FORESYN_CONTRACT_ADDRESS",
-            });
-        }
+        let chain_id = chain_id(&values)?;
+        let contract_address = contract_address(&values)?;
 
         let deployment_block = parse_u64(&values, "FORESYN_DEPLOYMENT_BLOCK")?;
         ensure_db_bigint("FORESYN_DEPLOYMENT_BLOCK", deployment_block)?;
@@ -112,6 +157,8 @@ pub enum ConfigError {
     UnsupportedScheme { name: &'static str, scheme: String },
     #[error("environment variable {name} must be a 20-byte EVM address")]
     InvalidAddress { name: &'static str },
+    #[error("environment variable {name} must be a valid socket address")]
+    InvalidSocketAddress { name: &'static str },
     #[error("environment variable {name} must not be the zero address")]
     ZeroAddress { name: &'static str },
     #[error("environment variable {name} must be greater than zero")]
@@ -122,6 +169,38 @@ pub enum ConfigError {
         value: u64,
         range: &'static str,
     },
+}
+
+fn database_url(values: &HashMap<String, String>) -> Result<String, ConfigError> {
+    let database_url = required(values, "DATABASE_URL")?;
+    let parsed = parse_url("DATABASE_URL", &database_url)?;
+    if !matches!(parsed.scheme(), "postgres" | "postgresql") {
+        return Err(ConfigError::UnsupportedScheme {
+            name: "DATABASE_URL",
+            scheme: parsed.scheme().to_owned(),
+        });
+    }
+    Ok(database_url)
+}
+
+fn chain_id(values: &HashMap<String, String>) -> Result<u64, ConfigError> {
+    let chain_id = parse_u64(values, "EVM_CHAIN_ID")?;
+    ensure_positive("EVM_CHAIN_ID", chain_id)?;
+    ensure_db_bigint("EVM_CHAIN_ID", chain_id)?;
+    Ok(chain_id)
+}
+
+fn contract_address(values: &HashMap<String, String>) -> Result<Address, ConfigError> {
+    let raw = required(values, "FORESYN_CONTRACT_ADDRESS")?;
+    let address = raw.parse().map_err(|_| ConfigError::InvalidAddress {
+        name: "FORESYN_CONTRACT_ADDRESS",
+    })?;
+    if address == Address::ZERO {
+        return Err(ConfigError::ZeroAddress {
+            name: "FORESYN_CONTRACT_ADDRESS",
+        });
+    }
+    Ok(address)
 }
 
 fn required(values: &HashMap<String, String>, name: &'static str) -> Result<String, ConfigError> {
@@ -166,7 +245,7 @@ fn ensure_db_bigint(name: &'static str, value: u64) -> Result<(), ConfigError> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{ConfigError, IndexerConfig};
+    use super::{ApiConfig, ConfigError, IndexerConfig};
 
     fn valid_values() -> HashMap<String, String> {
         [
@@ -197,6 +276,30 @@ mod tests {
         assert_eq!(config.deployment_block, 42);
         assert_eq!(config.confirmations, 6);
         assert_eq!(config.batch_size, 500);
+    }
+
+    #[test]
+    fn api_config_does_not_require_rpc_or_indexer_settings() {
+        let values = [
+            (
+                "DATABASE_URL",
+                "postgres://foresyn:secret@localhost/foresyn",
+            ),
+            ("EVM_CHAIN_ID", "31337"),
+            (
+                "FORESYN_CONTRACT_ADDRESS",
+                "0x1111111111111111111111111111111111111111",
+            ),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+
+        let config = ApiConfig::from_values(values).unwrap();
+
+        assert_eq!(config.chain_id, 31_337);
+        assert_eq!(config.bind_address.to_string(), "127.0.0.1:8080");
+        assert_eq!(config.cors_origin, "http://localhost:5173");
     }
 
     #[test]
