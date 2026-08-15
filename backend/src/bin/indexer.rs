@@ -298,6 +298,12 @@ mod tests {
                 stop_sender: Arc::new(Mutex::new(Some(sender))),
             }
         }
+
+        fn signal_stop(&self) {
+            if let Some(sender) = self.stop_sender.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+        }
     }
 
     #[async_trait]
@@ -305,9 +311,7 @@ mod tests {
         async fn run_once(&self) -> Result<RunSummary, IndexerError> {
             let run = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
             if self.stop_after == Some(run) {
-                if let Some(sender) = self.stop_sender.lock().unwrap().take() {
-                    let _ = sender.send(());
-                }
+                self.signal_stop();
             }
             Ok(RunSummary {
                 latest_block: run as u64,

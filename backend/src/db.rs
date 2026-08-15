@@ -16,6 +16,12 @@ use crate::{
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
+// PostgreSQL integration tests intentionally mutate shared projection tables.
+// The lock lives at module scope so tests in API and database modules serialize
+// when they use the same disposable TEST_DATABASE_URL under Rust's parallel runner.
+#[cfg(test)]
+pub(crate) static POSTGRES_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Clone)]
 pub struct Database {
     pool: PgPool,
@@ -866,8 +872,6 @@ mod tests {
         },
     };
 
-    static POSTGRES_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     async fn integration_pool() -> Option<PgPool> {
         let database_url = std::env::var("TEST_DATABASE_URL").ok()?;
         Some(
@@ -971,7 +975,7 @@ mod tests {
             eprintln!("skipping PostgreSQL integration test: TEST_DATABASE_URL is not set");
             return;
         };
-        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let _guard = super::POSTGRES_TEST_LOCK.lock().await;
         let database = Database::from_pool(pool.clone());
         database.migrate().await.unwrap();
         sqlx::query(
@@ -1375,7 +1379,7 @@ mod tests {
             eprintln!("skipping PostgreSQL integration test: TEST_DATABASE_URL is not set");
             return;
         };
-        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let _guard = super::POSTGRES_TEST_LOCK.lock().await;
         let database = Database::from_pool(pool.clone());
         database.migrate().await.unwrap();
         sqlx::query(

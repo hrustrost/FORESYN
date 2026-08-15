@@ -214,7 +214,7 @@ mod tests {
 
     use super::{ApiState, router};
     use crate::{
-        db::Database,
+        db::{Database, POSTGRES_TEST_LOCK},
         read_repository::{
             MarketReadModel, MarketReader, PositionReadModel, PostgresMarketReader, ReadError,
         },
@@ -480,6 +480,7 @@ mod tests {
             eprintln!("skipping PostgreSQL API test: TEST_DATABASE_URL is not set");
             return;
         };
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
         Database::from_pool(pool.clone()).migrate().await.unwrap();
 
         let chain_id = 71_337_i64;
