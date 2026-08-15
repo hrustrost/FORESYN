@@ -11,7 +11,7 @@ Foresyn now has a deterministic **contract-to-database-to-REST read path**.
 Implemented now:
 
 - a Rust workspace with an Axum health endpoint and scoped market/position read API;
-- a React + TypeScript + Vite shell with no wallet or market behavior;
+- a responsive, read-only React + TypeScript market dashboard with exact wei formatting;
 - PostgreSQL-only Docker Compose configuration;
 - SQLx migrations for canonical blocks, raw `MarketCreated`/`PositionTaken` logs, durable checkpoints, immutable markets, mutable pool state, and per-user positions;
 - a one-shot Rust/Alloy indexer with confirmed historical catch-up, bounded multi-event log queries, typed event decoding, restart-safe checkpoints, and deterministic reorganization rollback/rebuild/replay;
@@ -29,11 +29,13 @@ Not implemented yet:
 ## Architecture
 
 ```text
-React / TypeScript  -->  Rust / Axum  -->  PostgreSQL projections
-       |                                      ^
-       | wallet transactions                  | decoded, confirmed logs
-       v                                      |
-EVM prediction-market contract  -->  Rust / Alloy indexer
+wallet / EVM transaction
+          -> Solidity contract
+          -> EVM events
+          -> Rust / Alloy indexer
+          -> PostgreSQL projections
+          -> Axum REST API
+          -> React frontend
 ```
 
 The chain will be authoritative for market lifecycle, stakes, resolution, and claims. PostgreSQL will store replayable event history and query-optimized projections; it must never become a competing ledger. Descriptive metadata such as market titles and images remains off-chain.
@@ -124,8 +126,21 @@ Run the frontend:
 ```bash
 cd frontend
 npm install
+cp .env.example .env
 npm run dev
 ```
+
+On PowerShell, use `Copy-Item .env.example .env`. The frontend reads its API base
+URL from:
+
+```dotenv
+VITE_API_URL=http://localhost:8080
+```
+
+The browser talks only to the Axum REST API; it does not make EVM RPC requests.
+The current frontend is deliberately read-only: it displays indexed markets,
+pool balances, and participant positions without wallet connection or transaction
+submission.
 
 Useful verification commands:
 
@@ -133,7 +148,7 @@ Useful verification commands:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cd frontend && npm run build
+cd frontend && npm run build && npm run lint && npm test
 docker compose config
 ```
 
