@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-08-14
 - Reorganization handling: Superseded by [ADR 0004](0004-deterministic-reorg-recovery.md)
+- PositionTaken extension: Superseded by [ADR 0005](0005-position-projections.md)
 
 ## Context
 
@@ -46,9 +47,9 @@ Costs and limitations:
 - reads lag the chain by the configured confirmation count;
 - the command exits after catch-up rather than continuously following the head;
 - a malformed matching log requires operator intervention;
-- only `MarketCreated` is decoded and projected;
-- future event projections require a historical backfill or redesigned raw ingestion/checkpointing;
-- retry/backoff, WebSockets, and multi-event projections remain future work; common-ancestor recovery and rollback/replay are specified by ADR 0004.
+- this milestone decoded only `MarketCreated`; ADR 0005 adds `PositionTaken` through an explicit full reindex;
+- any further event projection still requires historical coverage or redesigned raw ingestion/checkpointing;
+- retry/backoff and WebSockets remain future work; common-ancestor recovery and rollback/replay are specified by ADR 0004.
 
 ## Alternatives considered
 

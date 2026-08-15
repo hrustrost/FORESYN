@@ -1,11 +1,17 @@
 use alloy::primitives::{Address, B256};
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
+use sqlx::{
+    PgPool, Postgres, Row, Transaction,
+    postgres::{PgPoolOptions, PgRow},
+};
 use thiserror::Error;
 
 use crate::{
     chain::{ChainBlock, ChainLog},
-    contracts::MarketCreatedProjection,
+    contracts::{
+        BinaryOutcome, DecodeError, DecodedEvent, MarketCreatedProjection, PositionTakenProjection,
+        decode_position_taken, position_taken_topic,
+    },
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -22,9 +28,9 @@ pub struct Checkpoint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MarketCreatedRecord {
+pub struct EventRecord {
     pub log: ChainLog,
-    pub projection: MarketCreatedProjection,
+    pub event: DecodedEvent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +39,7 @@ pub struct RollbackSummary {
     pub orphaned_blocks: u64,
     pub orphaned_events: u64,
     pub orphaned_market_projections: u64,
+    pub rebuilt_position_events: u64,
 }
 
 #[derive(Debug, Error)]
@@ -65,6 +72,23 @@ pub enum DbError {
         expected_hash: B256,
         stored_hash: B256,
     },
+    #[error(
+        "PositionTaken historical coverage is not proven for chain {chain_id}, contract {contract_address}; run the indexer with --full-reindex"
+    )]
+    PositionFullReindexRequired {
+        chain_id: u64,
+        contract_address: Address,
+    },
+    #[error(
+        "retained PositionTaken event at block {block_number}, transaction {transaction_hash}, log {log_index} cannot be decoded: {source}"
+    )]
+    RetainedPositionDecode {
+        block_number: u64,
+        transaction_hash: B256,
+        log_index: u64,
+        #[source]
+        source: DecodeError,
+    },
 }
 
 impl Database {
@@ -82,6 +106,128 @@ impl Database {
 
     pub async fn migrate(&self) -> Result<(), DbError> {
         MIGRATOR.run(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Establishes that this contract has PositionTaken coverage from deployment.
+    /// Existing pre-milestone state has no such proof and must be explicitly rebuilt.
+    pub async fn ensure_position_coverage(
+        &self,
+        chain_id: u64,
+        contract_address: Address,
+        deployment_block: u64,
+    ) -> Result<(), DbError> {
+        let chain_id_db = db_i64("chain_id", chain_id)?;
+        let deployment_block_db = db_i64("deployment_block", deployment_block)?;
+        let mut transaction = self.pool.begin().await?;
+        lock_chain_transaction(&mut transaction, chain_id_db).await?;
+
+        let recorded_from: Option<i64> = sqlx::query_scalar(
+            "SELECT position_taken_from_block
+             FROM indexer_contract_coverage
+             WHERE chain_id = $1 AND contract_address = $2
+             FOR UPDATE",
+        )
+        .bind(chain_id_db)
+        .bind(contract_address.as_slice())
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        if recorded_from == Some(deployment_block_db) {
+            transaction.commit().await?;
+            return Ok(());
+        }
+
+        let has_existing_state: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM indexed_blocks WHERE chain_id = $1
+             ) OR EXISTS (
+                 SELECT 1 FROM blockchain_events
+                 WHERE chain_id = $1 AND contract_address = $2
+             ) OR EXISTS (
+                 SELECT 1 FROM markets
+                 WHERE chain_id = $1 AND contract_address = $2
+             ) OR EXISTS (
+                 SELECT 1 FROM indexer_checkpoints
+                 WHERE chain_id = $1 AND contract_address = $2
+             )",
+        )
+        .bind(chain_id_db)
+        .bind(contract_address.as_slice())
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        if recorded_from.is_some() || has_existing_state {
+            return Err(DbError::PositionFullReindexRequired {
+                chain_id,
+                contract_address,
+            });
+        }
+
+        sqlx::query(
+            "INSERT INTO indexer_contract_coverage
+                (chain_id, contract_address, position_taken_from_block)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(chain_id_db)
+        .bind(contract_address.as_slice())
+        .bind(deployment_block_db)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Explicit destructive prototype reindex. Because indexed_blocks is keyed by
+    /// chain rather than contract, the documented model permits one indexed
+    /// Foresyn contract per chain and this clears that chain's index state.
+    pub async fn full_reindex(
+        &self,
+        chain_id: u64,
+        contract_address: Address,
+        deployment_block: u64,
+    ) -> Result<(), DbError> {
+        let chain_id_db = db_i64("chain_id", chain_id)?;
+        let deployment_block_db = db_i64("deployment_block", deployment_block)?;
+        let mut transaction = self.pool.begin().await?;
+        lock_chain_transaction(&mut transaction, chain_id_db).await?;
+
+        sqlx::query(
+            "DELETE FROM market_positions
+             WHERE chain_id = $1 AND contract_address = $2",
+        )
+        .bind(chain_id_db)
+        .bind(contract_address.as_slice())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM market_states
+             WHERE chain_id = $1 AND contract_address = $2",
+        )
+        .bind(chain_id_db)
+        .bind(contract_address.as_slice())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("DELETE FROM indexed_blocks WHERE chain_id = $1")
+            .bind(chain_id_db)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM indexer_contract_coverage WHERE chain_id = $1")
+            .bind(chain_id_db)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "INSERT INTO indexer_contract_coverage
+                (chain_id, contract_address, position_taken_from_block)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(chain_id_db)
+        .bind(contract_address.as_slice())
+        .bind(deployment_block_db)
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -136,11 +282,18 @@ impl Database {
         &self,
         chain_id: u64,
         contract_address: Address,
+        deployment_block: u64,
         ancestor: &Checkpoint,
     ) -> Result<RollbackSummary, DbError> {
         let mut transaction = self.pool.begin().await?;
         let summary = self
-            .rollback_chain_transaction(&mut transaction, chain_id, contract_address, ancestor)
+            .rollback_chain_transaction(
+                &mut transaction,
+                chain_id,
+                contract_address,
+                deployment_block,
+                ancestor,
+            )
             .await?;
         transaction.commit().await?;
         Ok(summary)
@@ -151,10 +304,12 @@ impl Database {
         transaction: &mut Transaction<'_, Postgres>,
         chain_id: u64,
         contract_address: Address,
+        deployment_block: u64,
         ancestor: &Checkpoint,
     ) -> Result<RollbackSummary, DbError> {
         let chain_id = db_i64("chain_id", chain_id)?;
         let ancestor_number = db_i64("block_number", ancestor.block_number)?;
+        let deployment_block = db_i64("deployment_block", deployment_block)?;
 
         lock_chain_transaction(transaction, chain_id).await?;
 
@@ -223,6 +378,46 @@ impl Database {
         .execute(&mut **transaction)
         .await?;
 
+        // Mutable projections cannot be rolled back by row provenance alone: an
+        // orphaned update may overwrite state accumulated before the ancestor.
+        sqlx::query(
+            "DELETE FROM market_positions
+             WHERE chain_id = $1 AND contract_address = $2",
+        )
+        .bind(chain_id)
+        .bind(contract_address.as_slice())
+        .execute(&mut **transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM market_states
+             WHERE chain_id = $1 AND contract_address = $2",
+        )
+        .bind(chain_id)
+        .bind(contract_address.as_slice())
+        .execute(&mut **transaction)
+        .await?;
+
+        let retained_events = sqlx::query(
+            "SELECT block_number, transaction_hash, log_index, topics, data
+             FROM blockchain_events
+             WHERE chain_id = $1
+               AND contract_address = $2
+               AND block_number BETWEEN $3 AND $4
+               AND topics[1] = $5
+             ORDER BY block_number, transaction_index, log_index",
+        )
+        .bind(chain_id)
+        .bind(contract_address.as_slice())
+        .bind(deployment_block)
+        .bind(ancestor_number)
+        .bind(position_taken_topic().as_slice())
+        .fetch_all(&mut **transaction)
+        .await?;
+
+        for row in &retained_events {
+            replay_retained_position(transaction, chain_id, contract_address, row).await?;
+        }
+
         // Deleting the old checkpoint through the block FK and recreating it here
         // makes the rewind durable in the same transaction as the cascade cleanup.
         sqlx::query(
@@ -246,6 +441,7 @@ impl Database {
             orphaned_blocks: delete_result.rows_affected(),
             orphaned_events,
             orphaned_market_projections,
+            rebuilt_position_events: retained_events.len() as u64,
         })
     }
 
@@ -254,7 +450,7 @@ impl Database {
         chain_id: u64,
         contract_address: Address,
         block: &ChainBlock,
-        events: &[MarketCreatedRecord],
+        events: &[EventRecord],
     ) -> Result<(), DbError> {
         let mut transaction = self.pool.begin().await?;
         self.persist_block_transaction(&mut transaction, chain_id, contract_address, block, events)
@@ -269,7 +465,7 @@ impl Database {
         chain_id: u64,
         contract_address: Address,
         block: &ChainBlock,
-        events: &[MarketCreatedRecord],
+        events: &[EventRecord],
     ) -> Result<(), DbError> {
         let chain_id = db_i64("chain_id", chain_id)?;
         let block_number = db_i64("block_number", block.number)?;
@@ -314,8 +510,29 @@ impl Database {
         for event in events {
             let inserted = insert_raw_event(transaction, chain_id, block, event).await?;
             if inserted {
-                insert_market_projection(transaction, chain_id, contract_address, block, event)
-                    .await?;
+                match &event.event {
+                    DecodedEvent::MarketCreated(projection) => {
+                        insert_market_projection(
+                            transaction,
+                            chain_id,
+                            contract_address,
+                            block,
+                            &event.log,
+                            projection,
+                        )
+                        .await?;
+                    }
+                    DecodedEvent::PositionTaken(projection) => {
+                        apply_position_projection(
+                            transaction,
+                            chain_id,
+                            contract_address,
+                            block.number,
+                            projection,
+                        )
+                        .await?;
+                    }
+                }
             }
         }
 
@@ -361,7 +578,7 @@ async fn insert_raw_event(
     transaction: &mut Transaction<'_, Postgres>,
     chain_id: i64,
     block: &ChainBlock,
-    event: &MarketCreatedRecord,
+    event: &EventRecord,
 ) -> Result<bool, DbError> {
     let topics: Vec<Vec<u8>> = event
         .log
@@ -437,10 +654,11 @@ async fn insert_market_projection(
     chain_id: i64,
     contract_address: Address,
     block: &ChainBlock,
-    event: &MarketCreatedRecord,
+    log: &ChainLog,
+    projection: &MarketCreatedProjection,
 ) -> Result<(), DbError> {
-    let market_id = event.projection.market_id.to_string();
-    let deadline = event.projection.deadline.to_string();
+    let market_id = projection.market_id.to_string();
+    let deadline = projection.deadline.to_string();
     let result = sqlx::query(
         "INSERT INTO markets
             (chain_id, contract_address, market_id, resolver, creator, deadline,
@@ -451,12 +669,12 @@ async fn insert_market_projection(
     .bind(chain_id)
     .bind(contract_address.as_slice())
     .bind(&market_id)
-    .bind(event.projection.resolver.as_slice())
-    .bind(event.projection.creator.as_slice())
+    .bind(projection.resolver.as_slice())
+    .bind(projection.creator.as_slice())
     .bind(&deadline)
-    .bind(event.projection.metadata_digest.as_slice())
+    .bind(projection.metadata_digest.as_slice())
     .bind(db_i64("creation_block_number", block.number)?)
-    .bind(event.log.transaction_hash.as_slice())
+    .bind(log.transaction_hash.as_slice())
     .execute(&mut **transaction)
     .await?;
 
@@ -477,23 +695,142 @@ async fn insert_market_projection(
     .await?;
 
     let identical = row.try_get::<Vec<u8>, _>("resolver")?.as_slice()
-        == event.projection.resolver.as_slice()
-        && row.try_get::<Vec<u8>, _>("creator")?.as_slice() == event.projection.creator.as_slice()
+        == projection.resolver.as_slice()
+        && row.try_get::<Vec<u8>, _>("creator")?.as_slice() == projection.creator.as_slice()
         && row.try_get::<String, _>("deadline")? == deadline
         && row.try_get::<Vec<u8>, _>("metadata_digest")?.as_slice()
-            == event.projection.metadata_digest.as_slice()
+            == projection.metadata_digest.as_slice()
         && row.try_get::<i64, _>("creation_block_number")?
             == db_i64("creation_block_number", block.number)?
         && row
             .try_get::<Vec<u8>, _>("creation_transaction_hash")?
             .as_slice()
-            == event.log.transaction_hash.as_slice();
+            == log.transaction_hash.as_slice();
 
     if identical {
         Ok(())
     } else {
         Err(DbError::MarketIdentityConflict)
     }
+}
+
+async fn apply_position_projection(
+    transaction: &mut Transaction<'_, Postgres>,
+    chain_id: i64,
+    contract_address: Address,
+    block_number: u64,
+    projection: &PositionTakenProjection,
+) -> Result<(), DbError> {
+    let market_id = projection.market_id.to_string();
+    let yes_pool = projection.yes_pool.to_string();
+    let no_pool = projection.no_pool.to_string();
+    let user_outcome_stake = projection.user_outcome_stake.to_string();
+    let block_number = db_i64("updated_block_number", block_number)?;
+
+    sqlx::query(
+        "INSERT INTO market_states
+            (chain_id, contract_address, market_id, yes_pool, no_pool, updated_block_number)
+         VALUES ($1, $2, $3::numeric, $4::numeric, $5::numeric, $6)
+         ON CONFLICT (chain_id, contract_address, market_id) DO UPDATE SET
+            yes_pool = EXCLUDED.yes_pool,
+            no_pool = EXCLUDED.no_pool,
+            updated_block_number = EXCLUDED.updated_block_number",
+    )
+    .bind(chain_id)
+    .bind(contract_address.as_slice())
+    .bind(&market_id)
+    .bind(&yes_pool)
+    .bind(&no_pool)
+    .bind(block_number)
+    .execute(&mut **transaction)
+    .await?;
+
+    match projection.outcome {
+        BinaryOutcome::Yes => {
+            sqlx::query(
+                "INSERT INTO market_positions
+                    (chain_id, contract_address, market_id, user_address,
+                     yes_stake, no_stake, updated_block_number)
+                 VALUES ($1, $2, $3::numeric, $4, $5::numeric, 0, $6)
+                 ON CONFLICT (chain_id, contract_address, market_id, user_address)
+                 DO UPDATE SET
+                    yes_stake = EXCLUDED.yes_stake,
+                    updated_block_number = EXCLUDED.updated_block_number",
+            )
+            .bind(chain_id)
+            .bind(contract_address.as_slice())
+            .bind(&market_id)
+            .bind(projection.user.as_slice())
+            .bind(&user_outcome_stake)
+            .bind(block_number)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        BinaryOutcome::No => {
+            sqlx::query(
+                "INSERT INTO market_positions
+                    (chain_id, contract_address, market_id, user_address,
+                     yes_stake, no_stake, updated_block_number)
+                 VALUES ($1, $2, $3::numeric, $4, 0, $5::numeric, $6)
+                 ON CONFLICT (chain_id, contract_address, market_id, user_address)
+                 DO UPDATE SET
+                    no_stake = EXCLUDED.no_stake,
+                    updated_block_number = EXCLUDED.updated_block_number",
+            )
+            .bind(chain_id)
+            .bind(contract_address.as_slice())
+            .bind(&market_id)
+            .bind(projection.user.as_slice())
+            .bind(&user_outcome_stake)
+            .bind(block_number)
+            .execute(&mut **transaction)
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn replay_retained_position(
+    transaction: &mut Transaction<'_, Postgres>,
+    chain_id: i64,
+    contract_address: Address,
+    row: &PgRow,
+) -> Result<(), DbError> {
+    let block_number_db: i64 = row.try_get("block_number")?;
+    let block_number = u64::try_from(block_number_db).map_err(|_| DbError::CorruptData {
+        field: "block_number",
+    })?;
+    let transaction_hash = fixed_bytes(
+        "transaction_hash",
+        &row.try_get::<Vec<u8>, _>("transaction_hash")?,
+    )?;
+    let log_index_db: i32 = row.try_get("log_index")?;
+    let log_index =
+        u64::try_from(log_index_db).map_err(|_| DbError::CorruptData { field: "log_index" })?;
+    let stored_topics: Vec<Vec<u8>> = row.try_get("topics")?;
+    let topics = stored_topics
+        .iter()
+        .map(|topic| fixed_bytes("topic", topic))
+        .collect::<Result<Vec<_>, _>>()?;
+    let data: Vec<u8> = row.try_get("data")?;
+    let projection = decode_position_taken(&topics, &data).map_err(|source| {
+        DbError::RetainedPositionDecode {
+            block_number,
+            transaction_hash,
+            log_index,
+            source,
+        }
+    })?;
+
+    apply_position_projection(
+        transaction,
+        chain_id,
+        contract_address,
+        block_number,
+        &projection,
+    )
+    .await
 }
 
 fn db_i64(field: &'static str, value: u64) -> Result<i64, DbError> {
@@ -514,14 +851,22 @@ fn fixed_bytes(field: &'static str, value: &[u8]) -> Result<B256, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, U256};
+    use alloy::{
+        primitives::{Address, B256, U256},
+        sol_types::SolEvent,
+    };
     use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 
-    use super::{Database, MarketCreatedRecord};
+    use super::{Database, EventRecord};
     use crate::{
         chain::{ChainBlock, ChainLog},
-        contracts::{MarketCreatedProjection, market_created_topic},
+        contracts::{
+            BinaryOutcome, DecodedEvent, MarketCreatedProjection, Outcome, PositionTaken,
+            decode_position_taken, market_created_topic,
+        },
     };
+
+    static POSTGRES_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn integration_pool() -> Option<PgPool> {
         let database_url = std::env::var("TEST_DATABASE_URL").ok()?;
@@ -543,7 +888,7 @@ mod tests {
         }
     }
 
-    fn event(block: &ChainBlock) -> MarketCreatedRecord {
+    fn event(block: &ChainBlock) -> EventRecord {
         event_with(block, Address::repeat_byte(0x44), U256::MAX, 0x55, 0x88)
     }
 
@@ -553,8 +898,8 @@ mod tests {
         market_id: U256,
         transaction_byte: u8,
         metadata_byte: u8,
-    ) -> MarketCreatedRecord {
-        MarketCreatedRecord {
+    ) -> EventRecord {
+        EventRecord {
             log: ChainLog {
                 block_number: block.number,
                 block_hash: block.hash,
@@ -565,13 +910,58 @@ mod tests {
                 topics: vec![market_created_topic(), B256::ZERO, B256::ZERO],
                 data: vec![0; 96],
             },
-            projection: MarketCreatedProjection {
+            event: DecodedEvent::MarketCreated(MarketCreatedProjection {
                 market_id,
                 resolver: Address::repeat_byte(0x66),
                 creator: Address::repeat_byte(0x77),
                 deadline: u64::MAX,
                 metadata_digest: B256::repeat_byte(metadata_byte),
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn position_event(
+        block: &ChainBlock,
+        contract: Address,
+        market_id: U256,
+        user: Address,
+        outcome: BinaryOutcome,
+        amount: U256,
+        user_outcome_stake: U256,
+        yes_pool: U256,
+        no_pool: U256,
+        transaction_byte: u8,
+        transaction_index: u64,
+        log_index: u64,
+    ) -> EventRecord {
+        let abi_outcome = match outcome {
+            BinaryOutcome::Yes => Outcome::Yes,
+            BinaryOutcome::No => Outcome::No,
+        };
+        let abi_event = PositionTaken {
+            marketId: market_id,
+            user,
+            outcome: abi_outcome,
+            amount,
+            userOutcomeStake: user_outcome_stake,
+            yesPool: yes_pool,
+            noPool: no_pool,
+        };
+        let encoded = abi_event.encode_log_data();
+        let projection = decode_position_taken(encoded.topics(), &encoded.data).unwrap();
+        EventRecord {
+            log: ChainLog {
+                block_number: block.number,
+                block_hash: block.hash,
+                transaction_hash: B256::repeat_byte(transaction_byte),
+                transaction_index,
+                log_index,
+                address: contract,
+                topics: encoded.topics().to_vec(),
+                data: encoded.data.to_vec(),
             },
+            event: DecodedEvent::PositionTaken(projection),
         }
     }
 
@@ -581,10 +971,12 @@ mod tests {
             eprintln!("skipping PostgreSQL integration test: TEST_DATABASE_URL is not set");
             return;
         };
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
         let database = Database::from_pool(pool.clone());
         database.migrate().await.unwrap();
         sqlx::query(
-            "TRUNCATE markets, indexer_checkpoints, blockchain_events, indexed_blocks CASCADE",
+            "TRUNCATE indexer_contract_coverage, markets, indexer_checkpoints,
+                      blockchain_events, indexed_blocks CASCADE",
         )
         .execute(&pool)
         .await
@@ -632,17 +1024,20 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        let DecodedEvent::MarketCreated(record_projection) = &record.event else {
+            panic!("test record must be MarketCreated");
+        };
         assert_eq!(
             projection.try_get::<String, _>("market_id").unwrap(),
             U256::MAX.to_string()
         );
         assert_eq!(
             projection.try_get::<Vec<u8>, _>("resolver").unwrap(),
-            record.projection.resolver.as_slice()
+            record_projection.resolver.as_slice()
         );
         assert_eq!(
             projection.try_get::<Vec<u8>, _>("creator").unwrap(),
-            record.projection.creator.as_slice()
+            record_projection.creator.as_slice()
         );
         assert_eq!(
             projection.try_get::<String, _>("deadline").unwrap(),
@@ -650,7 +1045,7 @@ mod tests {
         );
         assert_eq!(
             projection.try_get::<Vec<u8>, _>("metadata_digest").unwrap(),
-            record.projection.metadata_digest.as_slice()
+            record_projection.metadata_digest.as_slice()
         );
         assert_eq!(
             projection
@@ -695,7 +1090,8 @@ mod tests {
         assert_eq!(second_block_count, 0);
 
         sqlx::query(
-            "TRUNCATE markets, indexer_checkpoints, blockchain_events, indexed_blocks CASCADE",
+            "TRUNCATE indexer_contract_coverage, markets, indexer_checkpoints,
+                      blockchain_events, indexed_blocks CASCADE",
         )
         .execute(&pool)
         .await
@@ -764,6 +1160,7 @@ mod tests {
             .rollback_to_ancestor(
                 chain_id,
                 contract,
+                100,
                 &super::Checkpoint {
                     block_number: ancestor.number,
                     block_hash: ancestor.hash,
@@ -913,6 +1310,7 @@ mod tests {
                 &mut failed_transaction,
                 chain_id,
                 contract,
+                100,
                 &super::Checkpoint {
                     block_number: ancestor.number,
                     block_hash: ancestor.hash,
@@ -968,6 +1366,577 @@ mod tests {
                 .unwrap()
                 .block_number,
             102
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_position_projections_reindex_and_reorg_rebuild_are_deterministic() {
+        let Some(pool) = integration_pool().await else {
+            eprintln!("skipping PostgreSQL integration test: TEST_DATABASE_URL is not set");
+            return;
+        };
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let database = Database::from_pool(pool.clone());
+        database.migrate().await.unwrap();
+        sqlx::query(
+            "TRUNCATE indexer_contract_coverage, markets, indexer_checkpoints,
+                      blockchain_events, indexed_blocks CASCADE",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let chain_id = 31_337;
+        let contract = Address::repeat_byte(0x44);
+        let other_chain_id = 31_338;
+        let other_contract = Address::repeat_byte(0xaa);
+        let alice = Address::repeat_byte(0xa1);
+        let bob = Address::repeat_byte(0xb2);
+        let carol = Address::repeat_byte(0xc3);
+        let dave = Address::repeat_byte(0xd4);
+
+        // Seed another chain first; neither explicit full reindex nor later rollback
+        // for chain_id may alter it.
+        let other_200 = block(200, 0xe0, 0xdf);
+        let other_market = event_with(&other_200, other_contract, U256::from(7), 0xe1, 0xe2);
+        database
+            .commit_block(
+                other_chain_id,
+                other_contract,
+                &other_200,
+                std::slice::from_ref(&other_market),
+            )
+            .await
+            .unwrap();
+        let other_201 = block(201, 0xe3, 0xe0);
+        let other_position = position_event(
+            &other_201,
+            other_contract,
+            U256::from(7),
+            alice,
+            BinaryOutcome::Yes,
+            U256::from(8),
+            U256::from(8),
+            U256::from(8),
+            U256::ZERO,
+            0xe4,
+            0,
+            0,
+        );
+        database
+            .commit_block(
+                other_chain_id,
+                other_contract,
+                &other_201,
+                std::slice::from_ref(&other_position),
+            )
+            .await
+            .unwrap();
+
+        // A checkpoint created by the MarketCreated-only milestone has no durable
+        // proof of PositionTaken history and normal startup must leave it intact.
+        let legacy_100 = block(100, 0x10, 0x0f);
+        let legacy_market = event_with(&legacy_100, contract, U256::from(1), 0x11, 0x12);
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &legacy_100,
+                std::slice::from_ref(&legacy_market),
+            )
+            .await
+            .unwrap();
+        let error = database
+            .ensure_position_coverage(chain_id, contract, 100)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            super::DbError::PositionFullReindexRequired {
+                chain_id: 31_337,
+                contract_address
+            } if contract_address == contract
+        ));
+        assert_eq!(
+            database
+                .checkpoint(chain_id, contract)
+                .await
+                .unwrap()
+                .unwrap()
+                .block_number,
+            100
+        );
+
+        database
+            .full_reindex(chain_id, contract, 100)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .checkpoint(chain_id, contract)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        database
+            .ensure_position_coverage(chain_id, contract, 100)
+            .await
+            .unwrap();
+        let other_checkpoint = database
+            .checkpoint(other_chain_id, other_contract)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other_checkpoint.block_number, 201);
+
+        let canonical_100 = block(100, 0xa0, 0x9f);
+        let market = event_with(&canonical_100, contract, U256::from(1), 0x20, 0x21);
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &canonical_100,
+                std::slice::from_ref(&market),
+            )
+            .await
+            .unwrap();
+
+        let canonical_101 = block(101, 0xa1, 0xa0);
+        let alice_yes_2 = position_event(
+            &canonical_101,
+            contract,
+            U256::from(1),
+            alice,
+            BinaryOutcome::Yes,
+            U256::from(2),
+            U256::from(2),
+            U256::from(2),
+            U256::ZERO,
+            0x31,
+            0,
+            0,
+        );
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &canonical_101,
+                std::slice::from_ref(&alice_yes_2),
+            )
+            .await
+            .unwrap();
+        // Raw identity is the idempotency gate; the duplicate cannot reapply state.
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &canonical_101,
+                std::slice::from_ref(&alice_yes_2),
+            )
+            .await
+            .unwrap();
+
+        let canonical_102 = block(102, 0xa2, 0xa1);
+        let bob_no_3 = position_event(
+            &canonical_102,
+            contract,
+            U256::from(1),
+            bob,
+            BinaryOutcome::No,
+            U256::from(3),
+            U256::from(3),
+            U256::from(2),
+            U256::from(3),
+            0x32,
+            0,
+            0,
+        );
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &canonical_102,
+                std::slice::from_ref(&bob_no_3),
+            )
+            .await
+            .unwrap();
+
+        let canonical_103 = block(103, 0xa3, 0xa2);
+        let alice_yes_3 = position_event(
+            &canonical_103,
+            contract,
+            U256::from(1),
+            alice,
+            BinaryOutcome::Yes,
+            U256::from(1),
+            U256::from(3),
+            U256::from(3),
+            U256::from(3),
+            0x33,
+            0,
+            0,
+        );
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &canonical_103,
+                std::slice::from_ref(&alice_yes_3),
+            )
+            .await
+            .unwrap();
+
+        let state_at_103: (String, String, i64) = sqlx::query_as(
+            "SELECT yes_pool::text, no_pool::text, updated_block_number
+             FROM market_states
+             WHERE chain_id = $1 AND contract_address = $2 AND market_id = 1",
+        )
+        .bind(i64::try_from(chain_id).unwrap())
+        .bind(contract.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state_at_103, ("3".into(), "3".into(), 103));
+        let positions_at_103: Vec<(Vec<u8>, String, String)> = sqlx::query_as(
+            "SELECT user_address, yes_stake::text, no_stake::text
+             FROM market_positions
+             WHERE chain_id = $1 AND contract_address = $2 AND market_id = 1
+             ORDER BY user_address",
+        )
+        .bind(i64::try_from(chain_id).unwrap())
+        .bind(contract.as_slice())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            positions_at_103,
+            vec![
+                (alice.as_slice().to_vec(), "3".into(), "0".into()),
+                (bob.as_slice().to_vec(), "0".into(), "3".into()),
+            ]
+        );
+
+        // Same-user NO updates preserve Alice's YES side, and repeated emitted
+        // userOutcomeStake values replace rather than accumulate local state.
+        let orphaned_104 = block(104, 0xb4, 0xa3);
+        let alice_no_7 = position_event(
+            &orphaned_104,
+            contract,
+            U256::from(1),
+            alice,
+            BinaryOutcome::No,
+            U256::from(7),
+            U256::from(7),
+            U256::from(3),
+            U256::from(10),
+            0x34,
+            0,
+            0,
+        );
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &orphaned_104,
+                std::slice::from_ref(&alice_no_7),
+            )
+            .await
+            .unwrap();
+        let orphaned_105 = block(105, 0xb5, 0xb4);
+        let alice_no_9 = position_event(
+            &orphaned_105,
+            contract,
+            U256::from(1),
+            alice,
+            BinaryOutcome::No,
+            U256::from(2),
+            U256::from(9),
+            U256::from(3),
+            U256::from(12),
+            0x35,
+            0,
+            0,
+        );
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &orphaned_105,
+                std::slice::from_ref(&alice_no_9),
+            )
+            .await
+            .unwrap();
+        let alice_both: (String, String) = sqlx::query_as(
+            "SELECT yes_stake::text, no_stake::text FROM market_positions
+             WHERE chain_id = $1 AND contract_address = $2
+               AND market_id = 1 AND user_address = $3",
+        )
+        .bind(i64::try_from(chain_id).unwrap())
+        .bind(contract.as_slice())
+        .bind(alice.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(alice_both, ("3".into(), "9".into()));
+
+        // A uint256 maximum round-trips exactly, and the pool is SET to the
+        // emitted value (blindly adding amount=1 would produce 4 instead).
+        let orphaned_106 = block(106, 0xb6, 0xb5);
+        let dave_max = position_event(
+            &orphaned_106,
+            contract,
+            U256::from(1),
+            dave,
+            BinaryOutcome::Yes,
+            U256::from(1),
+            U256::MAX,
+            U256::MAX,
+            U256::from(12),
+            0x36,
+            0,
+            0,
+        );
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &orphaned_106,
+                std::slice::from_ref(&dave_max),
+            )
+            .await
+            .unwrap();
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &orphaned_106,
+                std::slice::from_ref(&dave_max),
+            )
+            .await
+            .unwrap();
+        let exact_max: (String, String, i64) = sqlx::query_as(
+            "SELECT s.yes_pool::text, p.yes_stake::text,
+                    (SELECT count(*) FROM blockchain_events
+                     WHERE chain_id = $1 AND transaction_hash = $4 AND log_index = 0)
+             FROM market_states s
+             JOIN market_positions p USING (chain_id, contract_address, market_id)
+             WHERE s.chain_id = $1 AND s.contract_address = $2
+               AND s.market_id = 1 AND p.user_address = $3",
+        )
+        .bind(i64::try_from(chain_id).unwrap())
+        .bind(contract.as_slice())
+        .bind(dave.as_slice())
+        .bind(dave_max.log.transaction_hash.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(exact_max, (U256::MAX.to_string(), U256::MAX.to_string(), 1));
+
+        // Rebuild through 103 restores Alice's pre-reorg YES stake and removes
+        // the orphan-only Dave row.
+        let rollback_103 = database
+            .rollback_to_ancestor(
+                chain_id,
+                contract,
+                100,
+                &super::Checkpoint {
+                    block_number: 103,
+                    block_hash: canonical_103.hash,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rollback_103.rebuilt_position_events, 3);
+        let rebuilt_alice: (String, String) = sqlx::query_as(
+            "SELECT yes_stake::text, no_stake::text FROM market_positions
+             WHERE chain_id = $1 AND contract_address = $2
+               AND market_id = 1 AND user_address = $3",
+        )
+        .bind(i64::try_from(chain_id).unwrap())
+        .bind(contract.as_slice())
+        .bind(alice.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rebuilt_alice, ("3".into(), "0".into()));
+        let dave_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM market_positions
+             WHERE chain_id = $1 AND contract_address = $2 AND user_address = $3",
+        )
+        .bind(i64::try_from(chain_id).unwrap())
+        .bind(contract.as_slice())
+        .bind(dave.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(dave_count, 0);
+
+        // The interview example diverges after MarketCreated at block 100.
+        database
+            .rollback_to_ancestor(
+                chain_id,
+                contract,
+                100,
+                &super::Checkpoint {
+                    block_number: 100,
+                    block_hash: canonical_100.hash,
+                },
+            )
+            .await
+            .unwrap();
+        let replacement_101 = block(101, 0xc1, 0xa0);
+        let alice_yes_4 = position_event(
+            &replacement_101,
+            contract,
+            U256::from(1),
+            alice,
+            BinaryOutcome::Yes,
+            U256::from(4),
+            U256::from(4),
+            U256::from(4),
+            U256::ZERO,
+            0x41,
+            0,
+            0,
+        );
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &replacement_101,
+                std::slice::from_ref(&alice_yes_4),
+            )
+            .await
+            .unwrap();
+        let replacement_102 = block(102, 0xc2, 0xc1);
+        let carol_no_5 = position_event(
+            &replacement_102,
+            contract,
+            U256::from(1),
+            carol,
+            BinaryOutcome::No,
+            U256::from(5),
+            U256::from(5),
+            U256::from(4),
+            U256::from(5),
+            0x42,
+            0,
+            0,
+        );
+        database
+            .commit_block(
+                chain_id,
+                contract,
+                &replacement_102,
+                std::slice::from_ref(&carol_no_5),
+            )
+            .await
+            .unwrap();
+
+        let replacement_state: (String, String) = sqlx::query_as(
+            "SELECT yes_pool::text, no_pool::text FROM market_states
+             WHERE chain_id = $1 AND contract_address = $2 AND market_id = 1",
+        )
+        .bind(i64::try_from(chain_id).unwrap())
+        .bind(contract.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(replacement_state, ("4".into(), "5".into()));
+        let replacement_positions: Vec<(Vec<u8>, String, String)> = sqlx::query_as(
+            "SELECT user_address, yes_stake::text, no_stake::text
+             FROM market_positions
+             WHERE chain_id = $1 AND contract_address = $2 AND market_id = 1
+             ORDER BY user_address",
+        )
+        .bind(i64::try_from(chain_id).unwrap())
+        .bind(contract.as_slice())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            replacement_positions,
+            vec![
+                (alice.as_slice().to_vec(), "4".into(), "0".into()),
+                (carol.as_slice().to_vec(), "0".into(), "5".into()),
+            ]
+        );
+        assert!(
+            !replacement_positions
+                .iter()
+                .any(|row| row.0 == bob.as_slice())
+        );
+
+        // A failure after destructive SQL has run but before COMMIT preserves the
+        // replacement projection and checkpoint exactly.
+        let before_failure: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT s.yes_pool::text, s.no_pool::text,
+                    (SELECT count(*) FROM market_positions
+                     WHERE chain_id = $1 AND contract_address = $2),
+                    (SELECT last_block_number FROM indexer_checkpoints
+                     WHERE chain_id = $1 AND contract_address = $2)
+             FROM market_states s
+             WHERE s.chain_id = $1 AND s.contract_address = $2 AND s.market_id = 1",
+        )
+        .bind(i64::try_from(chain_id).unwrap())
+        .bind(contract.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut failed_transaction = pool.begin().await.unwrap();
+        database
+            .rollback_chain_transaction(
+                &mut failed_transaction,
+                chain_id,
+                contract,
+                100,
+                &super::Checkpoint {
+                    block_number: 100,
+                    block_hash: canonical_100.hash,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query("SELECT 1 / 0")
+                .execute(&mut *failed_transaction)
+                .await
+                .is_err()
+        );
+        failed_transaction.rollback().await.unwrap();
+        let after_failure: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT s.yes_pool::text, s.no_pool::text,
+                    (SELECT count(*) FROM market_positions
+                     WHERE chain_id = $1 AND contract_address = $2),
+                    (SELECT last_block_number FROM indexer_checkpoints
+                     WHERE chain_id = $1 AND contract_address = $2)
+             FROM market_states s
+             WHERE s.chain_id = $1 AND s.contract_address = $2 AND s.market_id = 1",
+        )
+        .bind(i64::try_from(chain_id).unwrap())
+        .bind(contract.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after_failure, before_failure);
+
+        let other_state: (String, String, String, String, i64) = sqlx::query_as(
+            "SELECT s.yes_pool::text, s.no_pool::text,
+                    p.yes_stake::text, p.no_stake::text,
+                    c.last_block_number
+             FROM market_states s
+             JOIN market_positions p USING (chain_id, contract_address, market_id)
+             JOIN indexer_checkpoints c USING (chain_id, contract_address)
+             WHERE s.chain_id = $1 AND s.contract_address = $2 AND s.market_id = 7",
+        )
+        .bind(i64::try_from(other_chain_id).unwrap())
+        .bind(other_contract.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            other_state,
+            ("8".into(), "0".into(), "8".into(), "0".into(), 201)
         );
     }
 }

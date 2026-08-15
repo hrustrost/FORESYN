@@ -8,8 +8,8 @@ use tracing::{Instrument, debug, info, info_span, warn};
 use crate::{
     chain::{ChainBlock, ChainLog, ChainSource, RpcError},
     config::IndexerConfig,
-    contracts::{DecodeError, decode_market_created, market_created_topic},
-    db::{Checkpoint, Database, DbError, MarketCreatedRecord, RollbackSummary},
+    contracts::{DecodeError, decode_known_event, market_created_topic, position_taken_topic},
+    db::{Checkpoint, Database, DbError, EventRecord, RollbackSummary},
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -107,7 +107,7 @@ pub enum IndexerError {
         to_block: u64,
     },
     #[error(
-        "failed to decode MarketCreated at block {block_number}, transaction {transaction_hash}, log {log_index}: {source}"
+        "failed to decode known contract event at block {block_number}, transaction {transaction_hash}, log {log_index}: {source}"
     )]
     Decode {
         block_number: u64,
@@ -136,6 +136,7 @@ pub trait BlockStore: Send + Sync {
         &self,
         chain_id: u64,
         contract_address: Address,
+        deployment_block: u64,
         ancestor: &Checkpoint,
     ) -> Result<RollbackSummary, DbError>;
 
@@ -144,7 +145,7 @@ pub trait BlockStore: Send + Sync {
         chain_id: u64,
         contract_address: Address,
         block: &ChainBlock,
-        events: &[MarketCreatedRecord],
+        events: &[EventRecord],
     ) -> Result<(), DbError>;
 }
 
@@ -170,9 +171,10 @@ impl BlockStore for Database {
         &self,
         chain_id: u64,
         contract_address: Address,
+        deployment_block: u64,
         ancestor: &Checkpoint,
     ) -> Result<RollbackSummary, DbError> {
-        self.rollback_to_ancestor(chain_id, contract_address, ancestor)
+        self.rollback_to_ancestor(chain_id, contract_address, deployment_block, ancestor)
             .await
     }
 
@@ -181,7 +183,7 @@ impl BlockStore for Database {
         chain_id: u64,
         contract_address: Address,
         block: &ChainBlock,
-        events: &[MarketCreatedRecord],
+        events: &[EventRecord],
     ) -> Result<(), DbError> {
         self.commit_block(chain_id, contract_address, block, events)
             .await
@@ -343,6 +345,7 @@ where
             .rollback_to_ancestor(
                 self.config.chain_id,
                 self.config.contract_address,
+                self.config.deployment_block,
                 &ancestor,
             )
             .await?;
@@ -351,6 +354,7 @@ where
             orphaned_blocks = rollback.orphaned_blocks,
             orphaned_events = rollback.orphaned_events,
             orphaned_market_projections = rollback.orphaned_market_projections,
+            rebuilt_position_events = rollback.rebuilt_position_events,
             "rollback committed"
         );
         Ok(ancestor)
@@ -474,7 +478,7 @@ where
         expected_parent: &mut Option<B256>,
         summary: &mut RunSummary,
     ) -> Result<(), IndexerError> {
-        let logs = self
+        let mut logs = self
             .source
             .logs(
                 from_block,
@@ -483,6 +487,17 @@ where
                 market_created_topic(),
             )
             .await?;
+        logs.extend(
+            self.source
+                .logs(
+                    from_block,
+                    to_block,
+                    self.config.contract_address,
+                    position_taken_topic(),
+                )
+                .await?,
+        );
+        logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
         let mut logs_by_block = group_logs(logs, from_block, to_block)?;
 
         for block_number in from_block..=to_block {
@@ -582,10 +597,10 @@ fn decode_block_logs(
     contract_address: Address,
     block: &ChainBlock,
     logs: Vec<ChainLog>,
-) -> Result<Vec<MarketCreatedRecord>, IndexerError> {
+) -> Result<Vec<EventRecord>, IndexerError> {
     let mut records = Vec::new();
     for log in logs {
-        if log.address != contract_address || log.topics.first() != Some(&market_created_topic()) {
+        if log.address != contract_address {
             continue;
         }
         if log.block_hash != block.hash {
@@ -597,15 +612,16 @@ fn decode_block_logs(
                 actual_hash: log.block_hash,
             });
         }
-        let projection = decode_market_created(&log.topics, &log.data).map_err(|source| {
-            IndexerError::Decode {
+        let event =
+            decode_known_event(&log.topics, &log.data).map_err(|source| IndexerError::Decode {
                 block_number: log.block_number,
                 transaction_hash: log.transaction_hash,
                 log_index: log.log_index,
                 source,
-            }
-        })?;
-        records.push(MarketCreatedRecord { log, projection });
+            })?;
+        if let Some(event) = event {
+            records.push(EventRecord { log, event });
+        }
     }
     Ok(records)
 }
@@ -628,8 +644,11 @@ mod tests {
     use crate::{
         chain::{ChainBlock, ChainLog, ChainSource, RpcError},
         config::IndexerConfig,
-        contracts::{MarketCreated, market_created_topic},
-        db::{Checkpoint, DbError, MarketCreatedRecord, RollbackSummary},
+        contracts::{
+            BinaryOutcome, DecodedEvent, MarketCreated, Outcome, PositionTaken,
+            market_created_topic, position_taken_topic,
+        },
+        db::{Checkpoint, DbError, EventRecord, RollbackSummary},
     };
 
     type RequestedRange = (u64, u64, Address, B256);
@@ -639,7 +658,7 @@ mod tests {
         chain_id: u64,
         latest: u64,
         blocks: Arc<Mutex<BTreeMap<u64, VecDeque<ChainBlock>>>>,
-        logs: Arc<Mutex<VecDeque<Vec<ChainLog>>>>,
+        logs: Arc<Mutex<BTreeMap<B256, VecDeque<Vec<ChainLog>>>>>,
         requested_ranges: Arc<Mutex<Vec<RequestedRange>>>,
         requested_blocks: Arc<Mutex<Vec<u64>>>,
     }
@@ -681,7 +700,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((from_block, to_block, address, topic0));
-            let mut responses = self.logs.lock().unwrap();
+            let mut responses_by_topic = self.logs.lock().unwrap();
+            let Some(responses) = responses_by_topic.get_mut(&topic0) else {
+                return Ok(Vec::new());
+            };
             let logs = if responses.len() > 1 {
                 responses
                     .pop_front()
@@ -694,7 +716,11 @@ mod tests {
             };
             Ok(logs
                 .into_iter()
-                .filter(|log| (from_block..=to_block).contains(&log.block_number))
+                .filter(|log| {
+                    (from_block..=to_block).contains(&log.block_number)
+                        && log.address == address
+                        && log.topics.first() == Some(&topic0)
+                })
                 .collect())
         }
     }
@@ -708,7 +734,7 @@ mod tests {
     struct FakeStoreState {
         checkpoint: Option<Checkpoint>,
         indexed_blocks: BTreeMap<u64, B256>,
-        commits: Vec<(ChainBlock, Vec<MarketCreatedRecord>)>,
+        commits: Vec<(ChainBlock, Vec<EventRecord>)>,
         rollbacks: Vec<Checkpoint>,
     }
 
@@ -740,6 +766,7 @@ mod tests {
             &self,
             _chain_id: u64,
             _contract_address: Address,
+            _deployment_block: u64,
             ancestor: &Checkpoint,
         ) -> Result<RollbackSummary, DbError> {
             let mut state = self.state.lock().unwrap();
@@ -767,6 +794,7 @@ mod tests {
                 orphaned_blocks,
                 orphaned_events,
                 orphaned_market_projections: orphaned_events,
+                rebuilt_position_events: 0,
             })
         }
 
@@ -775,7 +803,7 @@ mod tests {
             _chain_id: u64,
             _contract_address: Address,
             block: &ChainBlock,
-            events: &[MarketCreatedRecord],
+            events: &[EventRecord],
         ) -> Result<(), DbError> {
             let mut state = self.state.lock().unwrap();
             state.checkpoint = Some(Checkpoint {
@@ -856,13 +884,32 @@ mod tests {
         blocks: BTreeMap<u64, Vec<ChainBlock>>,
         logs: Vec<ChainLog>,
     ) -> FakeSource {
-        scripted_source_with_logs(latest, blocks, vec![logs])
+        scripted_source_with_topic_logs(
+            latest,
+            blocks,
+            BTreeMap::from([
+                (market_created_topic(), vec![logs.clone()]),
+                (position_taken_topic(), vec![logs]),
+            ]),
+        )
     }
 
     fn scripted_source_with_logs(
         latest: u64,
         blocks: BTreeMap<u64, Vec<ChainBlock>>,
         log_responses: Vec<Vec<ChainLog>>,
+    ) -> FakeSource {
+        scripted_source_with_topic_logs(
+            latest,
+            blocks,
+            BTreeMap::from([(market_created_topic(), log_responses)]),
+        )
+    }
+
+    fn scripted_source_with_topic_logs(
+        latest: u64,
+        blocks: BTreeMap<u64, Vec<ChainBlock>>,
+        log_responses: BTreeMap<B256, Vec<Vec<ChainLog>>>,
     ) -> FakeSource {
         FakeSource {
             chain_id: 31_337,
@@ -873,7 +920,12 @@ mod tests {
                     .map(|(number, blocks)| (number, blocks.into()))
                     .collect(),
             )),
-            logs: Arc::new(Mutex::new(log_responses.into())),
+            logs: Arc::new(Mutex::new(
+                log_responses
+                    .into_iter()
+                    .map(|(topic, responses)| (topic, responses.into()))
+                    .collect(),
+            )),
             requested_ranges: Arc::default(),
             requested_blocks: Arc::default(),
         }
@@ -894,6 +946,35 @@ mod tests {
             transaction_hash: B256::repeat_byte(0x55),
             transaction_index: 2,
             log_index: 3,
+            address,
+            topics: encoded.topics().to_vec(),
+            data: encoded.data.to_vec(),
+        }
+    }
+
+    fn position_log(
+        block: &ChainBlock,
+        address: Address,
+        transaction_index: u64,
+        log_index: u64,
+        outcome: Outcome,
+    ) -> ChainLog {
+        let event = PositionTaken {
+            marketId: U256::from(99),
+            user: Address::repeat_byte(0x77),
+            outcome,
+            amount: U256::from(2),
+            userOutcomeStake: U256::from(7),
+            yesPool: U256::from(11),
+            noPool: U256::from(13),
+        };
+        let encoded = event.encode_log_data();
+        ChainLog {
+            block_number: block.number,
+            block_hash: block.hash,
+            transaction_hash: B256::with_last_byte(transaction_index as u8 + 0x60),
+            transaction_index,
+            log_index,
             address,
             topics: encoded.topics().to_vec(),
             data: encoded.data.to_vec(),
@@ -931,6 +1012,7 @@ mod tests {
         assert_eq!(
             requested_ranges
                 .iter()
+                .filter(|(_, _, _, topic)| *topic == market_created_topic())
                 .map(|(from, to, _, _)| (*from, *to))
                 .collect::<Vec<_>>(),
             vec![(10, 11), (12, 13), (14, 14)]
@@ -939,7 +1021,7 @@ mod tests {
             requested_ranges
                 .iter()
                 .all(|(_, _, address, topic)| *address == expected_contract
-                    && *topic == market_created_topic())
+                    && (*topic == market_created_topic() || *topic == position_taken_topic()))
         );
         assert_eq!(
             state
@@ -950,6 +1032,42 @@ mod tests {
                 .map(|(block, events)| (block.number, events.len()))
                 .collect::<Vec<_>>(),
             vec![(10, 0), (11, 0), (12, 1), (13, 0), (14, 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn merges_event_queries_in_deterministic_evm_order() {
+        let config = config(10, 10);
+        let chain_blocks = blocks(10, 10);
+        let block = chain_blocks.get(&10).unwrap();
+        let mut created = market_log(block, config.contract_address);
+        created.transaction_index = 0;
+        created.log_index = 8;
+        let position = position_log(block, config.contract_address, 1, 2, Outcome::Yes);
+        let source = source(10, chain_blocks, vec![position, created]);
+        let store = FakeStore::default();
+        let state = Arc::clone(&store.state);
+
+        let summary = Indexer::new(source, store, config)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(summary.events_committed, 2);
+        let state = state.lock().unwrap();
+        let events = &state.commits[0].1;
+        assert!(matches!(events[0].event, DecodedEvent::MarketCreated(_)));
+        assert!(matches!(
+            events[1].event,
+            DecodedEvent::PositionTaken(ref projection)
+                if projection.outcome == BinaryOutcome::Yes
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.log.transaction_index, event.log.log_index))
+                .collect::<Vec<_>>(),
+            vec![(0, 8), (1, 2)]
         );
     }
 
@@ -1377,7 +1495,7 @@ mod tests {
         let summary = indexer.run_once().await.unwrap();
 
         assert_eq!((summary.blocks_committed, summary.events_committed), (1, 1));
-        assert_eq!(requested_ranges.lock().unwrap().len(), 2);
+        assert_eq!(requested_ranges.lock().unwrap().len(), 4);
         {
             let state = state.lock().unwrap();
             assert_eq!(state.rollbacks.len(), 1);
@@ -1423,7 +1541,7 @@ mod tests {
             error,
             IndexerError::RecoveryLimitExceeded { block_number: 101 }
         ));
-        assert_eq!(requested_ranges.lock().unwrap().len(), 2);
+        assert_eq!(requested_ranges.lock().unwrap().len(), 4);
         let state = state.lock().unwrap();
         assert_eq!(state.rollbacks.len(), 1);
         assert_eq!(state.commits.len(), 1);

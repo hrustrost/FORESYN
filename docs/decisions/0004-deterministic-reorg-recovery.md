@@ -32,8 +32,9 @@ One PostgreSQL transaction:
 3. counts orphaned raw events and `MarketCreated` projections for observability;
 4. deletes `indexed_blocks` for the affected `chain_id` strictly above the ancestor;
 5. relies on existing `ON DELETE CASCADE` foreign keys to delete orphaned `blockchain_events`, `markets`, and checkpoints referencing deleted blocks;
-6. inserts or updates the configured contract checkpoint to the ancestor number and hash;
-7. commits.
+6. clears and deterministically rebuilds the configured contract's mutable `PositionTaken` projections from retained canonical raw events as specified by ADR 0005;
+7. inserts or updates the configured contract checkpoint to the ancestor number and hash;
+8. commits.
 
 The ancestor block, its raw events, and its market projection remain untouched. No explicit event or market delete duplicates the cascade behavior.
 
@@ -41,14 +42,14 @@ The block table is chain-scoped while checkpoints and projections are contract-s
 
 ### Canonical replay
 
-After rollback commits, the indexer reruns the normal catch-up path. The rewound checkpoint makes it start at `common_ancestor + 1`; it fetches canonical `MarketCreated` logs with `eth_getLogs`, processes blocks in ascending order, uses the existing per-block atomic commit, and stops at the confirmation-aware safe head. No separate replay writer exists.
+After rollback commits, the indexer reruns the normal catch-up path. The rewound checkpoint makes it start at `common_ancestor + 1`; it fetches canonical `MarketCreated` and `PositionTaken` logs with `eth_getLogs`, merges them in EVM order, uses the existing per-block atomic commit, and stops at the confirmation-aware safe head. No separate canonical-branch replay writer exists.
 
-Deleting orphaned creation blocks and replaying canonical logs is sufficient for the current immutable `MarketCreated` projection. Future mutable projections such as pools, volume, positions, resolution, and claims must be rebuilt deterministically from canonical events.
+Deleting orphaned creation blocks and replaying canonical logs remains sufficient for immutable `MarketCreated` rows. `market_states` and `market_positions` are cleared and replayed from retained canonical `PositionTaken` events inside rollback because an orphaned update can overwrite retained pre-ancestor state. [ADR 0005](0005-position-projections.md) defines that rebuild.
 
 ## Crash guarantees
 
 - **Before rollback commit:** PostgreSQL rolls the transaction back, leaving the old branch and checkpoint fully intact. A later run detects the reorganization again.
-- **After rollback commit but before replay:** the database durably contains the ancestor and checkpoint only. A later run resumes at `ancestor + 1`.
+- **After rollback commit but before replay:** the database durably contains the ancestor checkpoint and mutable projections rebuilt through the ancestor. A later run resumes at `ancestor + 1`.
 - **During canonical replay:** every completed block and checkpoint is durable together. A later run verifies the latest committed replay block and resumes at the following block.
 
 ## Consequences

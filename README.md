@@ -6,15 +6,15 @@ This repository is intentionally not a Polymarket clone. The first version will 
 
 ## Current status
 
-Foresyn has completed its first **contract-to-database indexing** vertical slice.
+Foresyn now has a deterministic **contract-to-database position projection** slice.
 
 Implemented now:
 
 - a Rust workspace with a minimal Axum `GET /health` service;
 - a React + TypeScript + Vite shell with no wallet or market behavior;
 - PostgreSQL-only Docker Compose configuration;
-- SQLx migrations for canonical blocks, raw contract logs, durable checkpoints, and a `MarketCreated` projection;
-- a one-shot Rust/Alloy indexer with confirmed historical catch-up, bounded log ranges, typed event decoding, restart-safe checkpoints, and parent-hash reorganization detection;
+- SQLx migrations for canonical blocks, raw `MarketCreated`/`PositionTaken` logs, durable checkpoints, immutable markets, mutable pool state, and per-user positions;
+- a one-shot Rust/Alloy indexer with confirmed historical catch-up, bounded multi-event log queries, typed event decoding, restart-safe checkpoints, and deterministic reorganization rollback/rebuild/replay;
 - a Solidity/Foundry binary pari-mutuel prediction-market contract;
 - Rust tests for configuration, decoding, ordering, idempotency, restart, rollback, malformed logs, filtering, and continuity, plus contract unit, fuzz, stateful invariant, reentrancy, and failed-receiver tests;
 - architecture, source-of-truth, and settlement-model documentation.
@@ -22,8 +22,8 @@ Implemented now:
 Not implemented yet:
 
 - market/query API endpoints beyond health;
-- indexing of contract events other than `MarketCreated`;
-- reorganization rollback/replay, continuous polling, or WebSocket subscriptions;
+- indexing of resolution, cancellation, and claim events;
+- continuous polling or WebSocket subscriptions;
 - wallet integration or transaction submission.
 
 ## Architecture
@@ -38,7 +38,7 @@ EVM prediction-market contract  -->  Rust / Alloy indexer
 
 The chain will be authoritative for market lifecycle, stakes, resolution, and claims. PostgreSQL will store replayable event history and query-optimized projections; it must never become a competing ledger. Descriptive metadata such as market titles and images remains off-chain.
 
-See [the architecture document](docs/architecture.md), [ADR 0001](docs/decisions/0001-on-chain-off-chain-boundary.md), [ADR 0002](docs/decisions/0002-settlement-and-claim-model.md), [ADR 0003](docs/decisions/0003-indexer-reliability-model.md), and [the settlement model](docs/settlement-model.md).
+See [the architecture document](docs/architecture.md), [ADR 0001](docs/decisions/0001-on-chain-off-chain-boundary.md), [ADR 0002](docs/decisions/0002-settlement-and-claim-model.md), [ADR 0003](docs/decisions/0003-indexer-reliability-model.md), [ADR 0004](docs/decisions/0004-deterministic-reorg-recovery.md), [ADR 0005](docs/decisions/0005-position-projections.md), and [the settlement model](docs/settlement-model.md).
 
 ## Repository layout
 
@@ -106,6 +106,14 @@ cargo run --locked -p foresyn-backend --bin indexer
 
 Required indexer configuration is `DATABASE_URL`, `EVM_RPC_URL`, `EVM_CHAIN_ID`, `FORESYN_CONTRACT_ADDRESS`, `FORESYN_DEPLOYMENT_BLOCK`, `INDEXER_CONFIRMATIONS`, and `INDEXER_BATCH_SIZE`. The command applies embedded SQLx migrations, resumes after the last transactionally committed block, catches up through `latest - confirmations`, then exits. It never scans before the configured deployment block on a fresh database.
 
+An index created by the earlier `MarketCreated`-only version cannot prove historical `PositionTaken` coverage. Its normal startup fails without deleting anything. Rebuild it explicitly from `FORESYN_DEPLOYMENT_BLOCK` with:
+
+```bash
+cargo run --locked -p foresyn-backend --bin indexer -- --full-reindex
+```
+
+Under the current documented model this clears Foresyn index/projection state for the configured chain, which supports one configured Foresyn contract per chain. Never point this prototype flag at shared or authoritative data.
+
 Run the frontend:
 
 ```bash
@@ -137,11 +145,13 @@ forge test --gas-report
 
 Database integration tests run when `TEST_DATABASE_URL` points to a disposable PostgreSQL database; otherwise the database-specific test prints a skip reason. The test truncates Foresyn indexing tables, so never point it at shared or production data.
 
-The end-to-end smoke helper also requires Foundry commands on `PATH`. It starts Anvil, deploys the contract, creates one market, runs the indexer twice, and verifies that raw and projected rows remain singular after restart:
+The end-to-end smoke helpers also require Foundry commands on `PATH`. The baseline verifies create/index/restart, the reorg smoke verifies immutable market replacement, and the position smoke verifies real `PositionTaken` pool/user projections across snapshot/revert recovery and restart:
 
 ```powershell
 $env:TEST_DATABASE_URL = 'postgres://foresyn:foresyn_dev_only@localhost:5432/foresyn'
 .\scripts\anvil-indexer-smoke.ps1
+.\scripts\anvil-reorg-smoke.ps1
+.\scripts\anvil-position-reorg-smoke.ps1
 ```
 
 ## Security disclaimer
