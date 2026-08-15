@@ -18,7 +18,7 @@ export function MarketDetail({ market, positions, actions }: MarketDetailProps) 
           <p className="eyebrow">On-chain market</p>
           <h2 id="detail-heading">Market #{market.market_id}</h2>
         </div>
-        <div className="readonly-pill">Read only</div>
+        <div className="readonly-pill">Indexed view</div>
       </header>
 
       <dl className="market-metadata">

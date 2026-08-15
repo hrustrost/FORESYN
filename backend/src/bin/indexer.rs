@@ -11,6 +11,31 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const INITIAL_RPC_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RPC_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct RpcBackoff {
+    next_delay: Duration,
+}
+
+impl RpcBackoff {
+    const fn new() -> Self {
+        Self {
+            next_delay: INITIAL_RPC_RETRY_DELAY,
+        }
+    }
+
+    fn take_delay(&mut self) -> Duration {
+        let delay = self.next_delay;
+        self.next_delay = self.next_delay.saturating_mul(2).min(MAX_RPC_RETRY_DELAY);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.next_delay = INITIAL_RPC_RETRY_DELAY;
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RunOptions {
@@ -97,23 +122,68 @@ where
     R: CatchUpRunner,
     F: Future<Output = ()>,
 {
+    run_indexer_with_sleep(runner, options, shutdown, tokio::time::sleep).await
+}
+
+async fn run_indexer_with_sleep<R, F, S, SF>(
+    runner: &R,
+    options: &RunOptions,
+    shutdown: F,
+    mut sleep: S,
+) -> Result<RunSummary, IndexerError>
+where
+    R: CatchUpRunner,
+    F: Future<Output = ()>,
+    S: FnMut(Duration) -> SF,
+    SF: Future<Output = ()>,
+{
     tokio::pin!(shutdown);
+    let mut backoff = RpcBackoff::new();
+    let mut last_summary = None;
 
     loop {
-        let summary = runner.run_once().await?;
-        log_summary(&summary, options.watch);
+        match runner.run_once().await {
+            Ok(summary) => {
+                backoff.reset();
+                log_summary(&summary, options.watch);
 
-        if !options.watch {
-            return Ok(summary);
-        }
+                if !options.watch {
+                    return Ok(summary);
+                }
 
-        tokio::select! {
-            biased;
-            () = &mut shutdown => {
-                info!("indexer watch shutdown requested");
-                return Ok(summary);
+                last_summary = Some(summary);
+                let shutdown_requested = tokio::select! {
+                    biased;
+                    () = &mut shutdown => true,
+                    () = sleep(options.poll_interval) => false,
+                };
+                if shutdown_requested {
+                    info!("indexer watch shutdown requested");
+                    return Ok(last_summary.expect("successful run stored above"));
+                }
             }
-            () = tokio::time::sleep(options.poll_interval) => {}
+            Err(error) => {
+                if !options.watch || !matches!(&error, IndexerError::Rpc(_)) {
+                    return Err(error);
+                }
+
+                let retry_delay = backoff.take_delay();
+                warn!(
+                    error = %error,
+                    retry_delay_ms = retry_delay.as_millis(),
+                    "transient RPC failure in watch mode; retrying"
+                );
+
+                let shutdown_requested = tokio::select! {
+                    biased;
+                    () = &mut shutdown => true,
+                    () = sleep(retry_delay) => false,
+                };
+                if shutdown_requested {
+                    info!("indexer watch shutdown requested during RPC retry backoff");
+                    return Ok(last_summary.unwrap_or_default());
+                }
+            }
         }
     }
 }
@@ -208,7 +278,8 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use std::{
-        future::pending,
+        collections::VecDeque,
+        future::{pending, ready},
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -222,10 +293,14 @@ mod tests {
         chain::{ChainBlock, ChainLog, ChainSource, RpcError},
         indexer::{IndexerError, RunSummary},
     };
-    use tokio::sync::oneshot;
+    use tokio::{
+        sync::{Notify, oneshot},
+        time::timeout,
+    };
 
     use super::{
         CatchUpRunner, RunOptions, parse_options_from, run_after_chain_preflight, run_indexer,
+        run_indexer_with_sleep,
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,6 +393,243 @@ mod tests {
                 ..RunSummary::default()
             })
         }
+    }
+
+    enum ScriptedOutcome {
+        Success(u64),
+        RpcFailure,
+        Fatal,
+    }
+
+    struct ScriptedRunner {
+        outcomes: Mutex<VecDeque<ScriptedOutcome>>,
+        runs: AtomicUsize,
+        stop_after: Option<usize>,
+        stop_sender: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    impl ScriptedRunner {
+        fn new(outcomes: impl IntoIterator<Item = ScriptedOutcome>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                runs: AtomicUsize::new(0),
+                stop_after: None,
+                stop_sender: Mutex::new(None),
+            }
+        }
+
+        fn stopping_after(
+            outcomes: impl IntoIterator<Item = ScriptedOutcome>,
+            runs: usize,
+            sender: oneshot::Sender<()>,
+        ) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                runs: AtomicUsize::new(0),
+                stop_after: Some(runs),
+                stop_sender: Mutex::new(Some(sender)),
+            }
+        }
+
+        fn run_count(&self) -> usize {
+            self.runs.load(Ordering::SeqCst)
+        }
+
+        fn signal_stop(&self) {
+            if let Some(sender) = self.stop_sender.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CatchUpRunner for ScriptedRunner {
+        async fn run_once(&self) -> Result<RunSummary, IndexerError> {
+            let run = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.stop_after == Some(run) {
+                self.signal_stop();
+            }
+
+            match self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted runner must have an outcome for every run")
+            {
+                ScriptedOutcome::Success(latest_block) => Ok(RunSummary {
+                    latest_block,
+                    ..RunSummary::default()
+                }),
+                ScriptedOutcome::RpcFailure => Err(IndexerError::Rpc(RpcError::Request {
+                    operation: "eth_blockNumber",
+                    message: "temporarily unavailable".into(),
+                })),
+                ScriptedOutcome::Fatal => Err(IndexerError::CheckpointOverflow),
+            }
+        }
+    }
+
+    fn watch_options() -> RunOptions {
+        RunOptions {
+            watch: true,
+            poll_interval: Duration::ZERO,
+            ..RunOptions::default()
+        }
+    }
+
+    #[test]
+    fn rpc_backoff_is_exponential_and_capped() {
+        let mut backoff = super::RpcBackoff::new();
+
+        assert_eq!(
+            (0..7).map(|_| backoff.take_delay()).collect::<Vec<_>>(),
+            [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs)
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_retries_an_rpc_failure_and_recovers() {
+        let (stop_sender, stop_receiver) = oneshot::channel();
+        let runner = ScriptedRunner::stopping_after(
+            [ScriptedOutcome::RpcFailure, ScriptedOutcome::Success(42)],
+            2,
+            stop_sender,
+        );
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let recorded_delays = Arc::clone(&delays);
+
+        let summary = run_indexer_with_sleep(
+            &runner,
+            &watch_options(),
+            async {
+                let _ = stop_receiver.await;
+            },
+            move |delay| {
+                recorded_delays.lock().unwrap().push(delay);
+                ready(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(runner.run_count(), 2);
+        assert_eq!(summary.latest_block, 42);
+        assert_eq!(
+            delays
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|delay| !delay.is_zero())
+                .collect::<Vec<_>>(),
+            vec![Duration::from_secs(1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_watch_run_resets_rpc_backoff() {
+        let (stop_sender, stop_receiver) = oneshot::channel();
+        let runner = ScriptedRunner::stopping_after(
+            [
+                ScriptedOutcome::RpcFailure,
+                ScriptedOutcome::Success(1),
+                ScriptedOutcome::RpcFailure,
+                ScriptedOutcome::Success(2),
+            ],
+            4,
+            stop_sender,
+        );
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let recorded_delays = Arc::clone(&delays);
+
+        let summary = run_indexer_with_sleep(
+            &runner,
+            &watch_options(),
+            async {
+                let _ = stop_receiver.await;
+            },
+            move |delay| {
+                recorded_delays.lock().unwrap().push(delay);
+                ready(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(runner.run_count(), 4);
+        assert_eq!(summary.latest_block, 2);
+        assert_eq!(
+            delays
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|delay| !delay.is_zero())
+                .collect::<Vec<_>>(),
+            vec![Duration::from_secs(1), Duration::from_secs(1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn non_rpc_watch_error_remains_fatal() {
+        let runner = ScriptedRunner::new([ScriptedOutcome::Fatal]);
+        let error = run_indexer_with_sleep(&runner, &watch_options(), pending(), |_| ready(()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, IndexerError::CheckpointOverflow));
+        assert_eq!(runner.run_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_shot_rpc_error_remains_fail_fast() {
+        let runner = ScriptedRunner::new([ScriptedOutcome::RpcFailure]);
+        let error =
+            run_indexer_with_sleep(&runner, &RunOptions::default(), pending(), |_| ready(()))
+                .await
+                .unwrap_err();
+
+        assert!(matches!(error, IndexerError::Rpc(_)));
+        assert_eq!(runner.run_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_rpc_retry_wait() {
+        let runner = Arc::new(ScriptedRunner::new([ScriptedOutcome::RpcFailure]));
+        let runner_in_task = Arc::clone(&runner);
+        let retry_wait_started = Arc::new(Notify::new());
+        let retry_wait_in_task = Arc::clone(&retry_wait_started);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            run_indexer_with_sleep(
+                runner_in_task.as_ref(),
+                &watch_options(),
+                async {
+                    let _ = shutdown_receiver.await;
+                },
+                move |_| {
+                    let retry_wait = Arc::clone(&retry_wait_in_task);
+                    async move {
+                        retry_wait.notify_one();
+                        pending::<()>().await;
+                    }
+                },
+            )
+            .await
+        });
+
+        retry_wait_started.notified().await;
+        shutdown_sender.send(()).unwrap();
+        let summary = timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown should interrupt retry backoff promptly")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary, RunSummary::default());
+        assert_eq!(runner.run_count(), 1);
     }
 
     #[tokio::test]

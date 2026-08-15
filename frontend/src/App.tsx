@@ -302,9 +302,9 @@ function App() {
             <h1 id="page-title">Market intelligence, reconstructed from events.</h1>
           </div>
           <p>
-            Confirmed EVM events are decoded by the Rust indexer and served from
-            disposable PostgreSQL projections. This interface never calls RPC or
-            submits transactions.
+            Market reads come from confirmed EVM events decoded by the Rust indexer
+            and served through Axum/PostgreSQL. Position writes are explicitly
+            user-signed in the injected wallet and sent to the EVM.
           </p>
         </section>
 
@@ -380,7 +380,7 @@ function App() {
       </main>
 
       <footer className="site-footer">
-        <span>Read-only interview demo</span>
+        <span>Indexed reads · wallet-signed writes</span>
         <span>Blockchain remains the financial source of truth</span>
       </footer>
     </div>
