@@ -1,8 +1,8 @@
 use alloy::primitives::Address;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use thiserror::Error;
-use serde::{Deserialize, Serialize};
 
 use crate::metadata::MarketMetadata;
 
@@ -203,45 +203,38 @@ impl MarketReader for PostgresMarketReader {
 }
 
 fn market_from_row(row: &sqlx::postgres::PgRow) -> Result<MarketReadModel, ReadError> {
-    let metadata_digest_hex = prefixed_hex(
-        "metadata_digest",
-        &row.try_get::<Vec<u8>, _>("metadata_digest")?,
-        32,
-    )?;
+    let on_chain_digest = row.try_get::<Vec<u8>, _>("metadata_digest")?;
+    let metadata_digest_hex = prefixed_hex("metadata_digest", &on_chain_digest, 32)?;
 
-    // Parse metadata from row if all fields are present
-    let (metadata, metadata_verified) = if let (Ok(question), Ok(description), Ok(resolution_criteria), Ok(category)) = (
-        row.try_get::<Option<String>, _>("question"),
-        row.try_get::<Option<String>, _>("description"),
-        row.try_get::<Option<String>, _>("resolution_criteria"),
-        row.try_get::<Option<String>, _>("category"),
+    // The metadata columns come from a LEFT JOIN, so they are all NULL for a
+    // market with no off-chain metadata (Market #1). Such a market is reported
+    // with no metadata at all rather than as unverified metadata.
+    let (metadata, metadata_verified) = match (
+        row.try_get::<Option<String>, _>("question")?,
+        row.try_get::<Option<String>, _>("description")?,
+        row.try_get::<Option<String>, _>("resolution_criteria")?,
+        row.try_get::<Option<String>, _>("category")?,
     ) {
-        match (question, description, resolution_criteria, category) {
-            (Some(q), Some(d), Some(rc), Some(cat)) => {
-                let source_url: Option<String> = row.try_get("source_url").unwrap_or(None);
-                let metadata_obj = MarketMetadata {
-                    question: q,
-                    description: d,
-                    resolution_criteria: rc,
-                    category: cat,
-                    source_url,
-                };
+        (Some(question), Some(description), Some(resolution_criteria), Some(category)) => {
+            let metadata = MarketMetadata {
+                question,
+                description,
+                resolution_criteria,
+                category,
+                source_url: row.try_get("source_url")?,
+            };
 
-                // Verify digest matches
-                let on_chain_digest_hex = metadata_digest_hex.trim_start_matches("0x");
-                let verified = if let Ok(digest) = metadata_obj.compute_digest() {
-                    let computed_hex = format!("{:x}", digest);
-                    computed_hex == on_chain_digest_hex
-                } else {
-                    false
-                };
+            // Recompute the digest from the stored text and compare it to the
+            // value the indexer read from the chain. Metadata that fails this
+            // check is still returned, but flagged, so a mismatch is visible
+            // rather than silently rendered as authentic.
+            let verified = metadata
+                .compute_digest()
+                .is_ok_and(|computed| computed.as_slice() == on_chain_digest.as_slice());
 
-                (Some(metadata_obj), Some(verified))
-            }
-            _ => (None, None),
+            (Some(metadata), Some(verified))
         }
-    } else {
-        (None, None)
+        _ => (None, None),
     };
 
     Ok(MarketReadModel {

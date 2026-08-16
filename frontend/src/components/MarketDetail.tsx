@@ -11,16 +11,21 @@ interface MarketDetailProps {
 }
 
 export function MarketDetail({ market, positions, actions }: MarketDetailProps) {
-  const hasVerifiedMetadata = market.metadata && market.metadata_verified
+  const { metadata } = market
+  // Only metadata whose digest matches the indexed on-chain commitment may be
+  // presented as this market's question. Anything else falls back to the
+  // technical label rather than showing text the chain does not vouch for.
+  const verifiedMetadata = metadata && market.metadata_verified ? metadata : undefined
+  const hasUnverifiedMetadata = Boolean(metadata) && !market.metadata_verified
 
   return (
     <article className="market-detail" aria-labelledby="detail-heading">
       <header className="market-detail__header">
         <div>
-          {hasVerifiedMetadata && market.metadata ? (
+          {verifiedMetadata ? (
             <>
               <h2 id="detail-heading" className="market-detail__question">
-                {market.metadata.question}
+                {verifiedMetadata.question}
               </h2>
               <p className="eyebrow">Market #{market.market_id}</p>
             </>
@@ -28,34 +33,52 @@ export function MarketDetail({ market, positions, actions }: MarketDetailProps) 
             <>
               <p className="eyebrow">On-chain market</p>
               <h2 id="detail-heading">Market #{market.market_id}</h2>
-              {!market.metadata && (
-                <p className="market-detail__unavailable">Metadata unavailable</p>
-              )}
+              <p className="market-detail__unavailable">
+                {hasUnverifiedMetadata
+                  ? 'Metadata does not match the on-chain digest'
+                  : 'Metadata unavailable'}
+              </p>
             </>
           )}
         </div>
         <div className="status-badges">
-          {hasVerifiedMetadata && (
+          {verifiedMetadata && (
             <div className="verified-badge">VERIFIED METADATA</div>
           )}
           <div className="readonly-pill">Indexed view</div>
         </div>
       </header>
 
-      {hasVerifiedMetadata && market.metadata && (
+      {verifiedMetadata && (
         <section className="market-detail__metadata">
           <p className="metadata-description">
-            {market.metadata.description}
+            {verifiedMetadata.description}
           </p>
           <div className="resolution-criteria">
             <dt>Resolution criteria</dt>
-            <dd>{market.metadata.resolution_criteria}</dd>
+            <dd>{verifiedMetadata.resolution_criteria}</dd>
           </div>
           <div className="metadata-category">
-            <span className="category-badge">{market.metadata.category}</span>
+            <span className="category-badge">{verifiedMetadata.category}</span>
+            {verifiedMetadata.source_url && (
+              <a
+                className="metadata-source"
+                href={verifiedMetadata.source_url}
+                target="_blank"
+                rel="noreferrer noopener"
+              >
+                Source
+              </a>
+            )}
           </div>
         </section>
       )}
+
+      <p className="resolver-notice">
+        Demonstration market. The outcome is submitted by the trusted resolver
+        account below — there is no price oracle, and no ETH/USD value is read
+        on-chain.
+      </p>
 
       <dl className="market-metadata">
         <div>

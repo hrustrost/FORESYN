@@ -89,6 +89,58 @@ The indexer maintains durable checkpoints, validates canonical chain state and d
 - exact `uint256` handling without JavaScript floating-point conversion
 - Foundry unit, fuzz and stateful invariant testing
 - PostgreSQL integration and Anvil end-to-end smoke testing
+- **off-chain metadata model with cryptographic integrity: human-readable market data (question, description, resolution criteria) stored in PostgreSQL while its deterministic keccak256 digest is committed on-chain, ensuring metadata cannot be tampered with post-creation**
+
+## Metadata Architecture
+
+Markets store two categories of data:
+
+| Data | Location | Authority | Reason |
+|------|----------|-----------|--------|
+| Market ID, deadline, resolver, stakes, outcomes, resolution | Solidity contract | Blockchain | Financial settlement requires on-chain immutability |
+| Metadata digest (32-byte hash) | Solidity contract | Blockchain | Cryptographic commitment to metadata integrity |
+| Human-readable question, description, resolution criteria, category | PostgreSQL | Off-chain | Expensive to store on-chain; metadata is for presentation, not settlement |
+
+**Metadata flow:**
+1. Serialize the metadata to canonical JSON with a fixed field order
+   (`question`, `description`, `resolution_criteria`, `category`, `source_url`)
+2. Compute `keccak256(canonical_json)` → `metadataDigest`
+3. Commit `metadataDigest` on-chain via `createMarket()`; the contract stores the
+   32 bytes verbatim and never interprets them
+4. Store the human-readable text in the PostgreSQL `market_metadata` table, keyed
+   by the same `(chain_id, contract_address, market_id)` as every other projection
+5. On read, the API re-hashes the stored text and compares it to the digest the
+   indexer recorded from the chain, returning the result as `metadata_verified`
+6. The frontend promotes the question to the title only when `metadata_verified`
+   is true, alongside a `VERIFIED METADATA` badge
+
+The canonical JSON is assembled by explicit concatenation rather than by
+serializing a `serde_json::Map`, whose key order depends on whether the
+`preserve_order` feature is enabled anywhere in the dependency graph. Field
+order, field names, and the `source_url` null form are part of the digest
+contract and are pinned by tests in `backend/src/metadata.rs`.
+
+This design ensures:
+- Metadata cannot be changed after market creation without detection
+- Human-readable data is cheap to store and serve
+- Integrity is cryptographically provable
+- No long text ever needs to live on-chain
+
+Verification is reported honestly rather than assumed. A market with no stored
+metadata renders as `Market #N` with `Metadata unavailable`; a market whose text
+does not re-hash to its on-chain digest is shown as unverified rather than as a
+question the chain vouches for. No metadata is invented to fill a gap.
+
+**Resolution is a trusted human action.** The resolver named on each market
+submits the outcome directly. There is no oracle, and no price is read on-chain,
+so a market referencing an external value such as ETH/USD is a demonstration of
+the settlement mechanism rather than an automated feed.
+
+To prepare a new market, `backend/src/bin/generate-market-2.rs` prints the
+canonical JSON, the digest, the exact `createMarket` command, and the matching
+SQL insert. It computes and prints only — it holds no key, opens no RPC
+connection, and broadcasts nothing.
+
 
 ## Current status
 

@@ -24,24 +24,50 @@ pub enum MetadataError {
 impl MarketMetadata {
     /// Serialize metadata to canonical JSON format for deterministic hashing.
     ///
-    /// The serialization order is fixed to ensure consistent hashing:
+    /// The field order is fixed and part of the digest contract:
     /// 1. question
     /// 2. description
     /// 3. resolution_criteria
     /// 4. category
-    /// 5. source_url (nullable)
+    /// 5. source_url (null when absent)
+    ///
+    /// The object is built by explicit string concatenation rather than by
+    /// serializing a `serde_json::Map`. A `Map` orders its keys according to
+    /// whether serde_json's `preserve_order` feature is enabled anywhere in the
+    /// dependency graph, so relying on it would let an unrelated dependency
+    /// silently change every digest. Only the individual values go through
+    /// serde_json, purely for correct JSON string escaping.
+    ///
+    /// Changing the field order, the field names, or the `source_url` null
+    /// representation invalidates every digest already committed on-chain.
     pub fn to_canonical_json(&self) -> Result<Vec<u8>, MetadataError> {
-        // Use a structured approach to ensure field order
-        let canonical = serde_json::json!({
-            "question": self.question,
-            "description": self.description,
-            "resolution_criteria": self.resolution_criteria,
-            "category": self.category,
-            "source_url": self.source_url,
-        });
+        fn encode(value: &str) -> Result<String, MetadataError> {
+            serde_json::to_string(value).map_err(|e| MetadataError::Serialization(e.to_string()))
+        }
 
-        serde_json::to_vec(&canonical)
-            .map_err(|e| MetadataError::Serialization(e.to_string()))
+        let source_url = match self.source_url.as_deref() {
+            Some(url) => encode(url)?,
+            None => "null".to_string(),
+        };
+
+        let canonical = format!(
+            concat!(
+                "{{",
+                "\"question\":{},",
+                "\"description\":{},",
+                "\"resolution_criteria\":{},",
+                "\"category\":{},",
+                "\"source_url\":{}",
+                "}}"
+            ),
+            encode(&self.question)?,
+            encode(&self.description)?,
+            encode(&self.resolution_criteria)?,
+            encode(&self.category)?,
+            source_url,
+        );
+
+        Ok(canonical.into_bytes())
     }
 
     /// Compute keccak256 hash of canonical metadata JSON.
@@ -64,6 +90,108 @@ impl MarketMetadata {
 mod tests {
     use super::*;
 
+    /// The exact metadata intended for Base Sepolia Market #2.
+    fn market_2_metadata() -> MarketMetadata {
+        MarketMetadata {
+            question: "Will ETH be above $4,000 on August 22, 2026?".to_string(),
+            description: "A Base Sepolia demonstration prediction market for FORESYN.".to_string(),
+            resolution_criteria: "Resolves YES if the ETH/USD reference price is strictly above 4000 USD at the market deadline. Otherwise resolves NO.".to_string(),
+            category: "Crypto".to_string(),
+            source_url: None,
+        }
+    }
+
+    /// Pins the byte-for-byte canonical form. This is the digest contract: if
+    /// this test fails, every digest already committed on-chain is invalidated.
+    #[test]
+    fn canonical_json_bytes_are_pinned() {
+        let canonical = market_2_metadata().to_canonical_json().unwrap();
+
+        assert_eq!(
+            String::from_utf8(canonical).unwrap(),
+            concat!(
+                r#"{"question":"Will ETH be above $4,000 on August 22, 2026?","#,
+                r#""description":"A Base Sepolia demonstration prediction market for FORESYN.","#,
+                r#""resolution_criteria":"Resolves YES if the ETH/USD reference price is strictly"#,
+                r#" above 4000 USD at the market deadline. Otherwise resolves NO.","#,
+                r#""category":"Crypto","#,
+                r#""source_url":null}"#,
+            ),
+        );
+    }
+
+    /// Pins the digest that will be committed on-chain for Market #2, so the
+    /// value quoted in the create-market command can never drift silently.
+    #[test]
+    fn market_2_digest_is_pinned() {
+        let digest = market_2_metadata().compute_digest().unwrap();
+
+        assert_eq!(
+            format!("{digest:?}"),
+            "0xca3422b0b137aacb93c63a5cd26a8edccaaa30785067afb912c72ddda02a1659",
+        );
+    }
+
+    /// The canonical form must not depend on serde_json's map key ordering.
+    #[test]
+    fn canonical_json_field_order_is_explicit_not_alphabetical() {
+        let canonical = market_2_metadata().to_canonical_json().unwrap();
+        let text = String::from_utf8(canonical).unwrap();
+
+        let question = text.find(r#""question""#).unwrap();
+        let description = text.find(r#""description""#).unwrap();
+        let criteria = text.find(r#""resolution_criteria""#).unwrap();
+        let category = text.find(r#""category""#).unwrap();
+        let source_url = text.find(r#""source_url""#).unwrap();
+
+        assert!(question < description);
+        assert!(description < criteria);
+        assert!(criteria < category);
+        assert!(category < source_url);
+    }
+
+    /// `source_url` must always be present as an explicit null, never omitted,
+    /// otherwise a market with no source would hash differently.
+    #[test]
+    fn absent_source_url_is_an_explicit_null() {
+        let mut metadata = market_2_metadata();
+        let without = metadata.to_canonical_json().unwrap();
+        assert!(
+            String::from_utf8(without)
+                .unwrap()
+                .contains(r#""source_url":null"#)
+        );
+
+        metadata.source_url = Some("https://example.com".to_string());
+        let with = metadata.to_canonical_json().unwrap();
+        assert!(
+            String::from_utf8(with)
+                .unwrap()
+                .contains(r#""source_url":"https://example.com""#)
+        );
+    }
+
+    /// Values containing JSON metacharacters must be escaped, not injected raw.
+    #[test]
+    fn values_with_json_metacharacters_are_escaped() {
+        let metadata = MarketMetadata {
+            question: r#"Is "x" > 1?"#.to_string(),
+            description: "line\nbreak".to_string(),
+            resolution_criteria: r"back\slash".to_string(),
+            category: "Crypto".to_string(),
+            source_url: None,
+        };
+
+        let canonical = metadata.to_canonical_json().unwrap();
+        let text = String::from_utf8(canonical).unwrap();
+
+        // Must still parse as JSON and round-trip the original values.
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["question"], r#"Is "x" > 1?"#);
+        assert_eq!(parsed["description"], "line\nbreak");
+        assert_eq!(parsed["resolution_criteria"], r"back\slash");
+    }
+
     #[test]
     fn test_metadata_canonical_json() {
         let metadata = MarketMetadata {
@@ -84,7 +212,10 @@ mod tests {
 
         // Parse back to verify structure
         let parsed: serde_json::Value = serde_json::from_str(&canonical_str).unwrap();
-        assert_eq!(parsed["question"], "Will ETH be above $4,000 on August 22, 2026?");
+        assert_eq!(
+            parsed["question"],
+            "Will ETH be above $4,000 on August 22, 2026?"
+        );
         assert_eq!(parsed["category"], "Crypto");
     }
 

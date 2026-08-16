@@ -1114,6 +1114,136 @@ h1 {
   text-transform: uppercase;
 }
 
+/* Metadata display styles */
+.market-card__title {
+  display: block;
+  margin-bottom: 0.5rem;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: -0.02em;
+}
+
+.market-number-label {
+  display: block;
+  margin-bottom: 0.75rem;
+  color: var(--muted);
+  font-size: 0.65rem;
+  font-family: "DM Mono", monospace;
+  font-weight: 500;
+}
+
+.market-detail__question {
+  font-size: clamp(1.35rem, 2.2vw, 1.75rem);
+  line-height: 1.35;
+  margin-bottom: 0.35rem;
+}
+
+.market-detail__unavailable {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-style: italic;
+}
+
+.market-detail__metadata {
+  margin: 1.5rem 0;
+  padding: 1.2rem;
+  border-left: 3px solid var(--yes);
+  background: rgb(78 226 138 / 4%);
+  border-radius: 0.5rem;
+}
+
+.metadata-description {
+  margin: 0 0 1rem;
+  color: var(--text);
+  font-size: 0.95rem;
+  line-height: 1.65;
+}
+
+.resolution-criteria {
+  margin: 1rem 0;
+}
+
+.resolution-criteria dt {
+  margin-bottom: 0.35rem;
+  color: var(--faint);
+  font-size: 0.65rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.resolution-criteria dd {
+  margin: 0;
+  color: #b9c5bd;
+  font-size: 0.88rem;
+  line-height: 1.6;
+  font-family: inherit;
+}
+
+.metadata-category {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  margin-top: 1rem;
+}
+
+.metadata-source {
+  color: var(--yes);
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+/* Prototype disclosure: settlement is a trusted human action, not an oracle. */
+.resolver-notice {
+  margin: 1.25rem 0 0;
+  padding: 0.7rem 0.85rem;
+  border-left: 2px solid var(--faint);
+  color: var(--muted);
+  background: rgb(255 255 255 / 2%);
+  border-radius: 0.35rem;
+  font-size: 0.78rem;
+  line-height: 1.55;
+}
+
+.category-badge {
+  display: inline-block;
+  padding: 0.35rem 0.65rem;
+  border: 1px solid rgb(78 226 138 / 35%);
+  border-radius: 0.35rem;
+  color: var(--yes);
+  background: var(--yes-soft);
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.status-badges {
+  display: flex;
+  gap: 0.55rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.verified-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 1.6rem;
+  padding: 0.25rem 0.55rem;
+  border: 1px solid rgb(78 226 138 / 35%);
+  border-radius: 999px;
+  color: var(--yes);
+  background: var(--yes-soft);
+  font-family: "DM Mono", monospace;
+  font-size: 0.64rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
 @media (max-width: 980px) {
   .intro {
     grid-template-columns: 1fr;

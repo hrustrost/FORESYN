@@ -224,6 +224,7 @@ mod tests {
     use super::{ApiState, router};
     use crate::{
         db::{Database, POSTGRES_TEST_LOCK},
+        metadata::MarketMetadata,
         read_repository::{
             MarketReadModel, MarketReader, PositionReadModel, PostgresMarketReader, ReadError,
         },
@@ -321,6 +322,8 @@ mod tests {
             yes_pool: "340282366920938463463374607431768211455".into(),
             no_pool: "5".into(),
             total_pool: "340282366920938463463374607431768211460".into(),
+            metadata: None,
+            metadata_verified: None,
         }
     }
 
@@ -653,6 +656,164 @@ mod tests {
         sqlx::query("DELETE FROM indexed_blocks WHERE chain_id IN ($1, $2)")
             .bind(chain_id)
             .bind(other_chain_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// End-to-end proof of the integrity link: metadata stored off-chain is
+    /// re-hashed on read and compared against the digest the indexer recorded
+    /// from the chain. Covers all three cases a client can observe.
+    #[tokio::test]
+    async fn postgres_metadata_is_verified_against_the_indexed_on_chain_digest() {
+        let Some(pool) = integration_pool().await else {
+            eprintln!("skipping PostgreSQL metadata test: TEST_DATABASE_URL is not set");
+            return;
+        };
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        Database::from_pool(pool.clone()).migrate().await.unwrap();
+
+        let chain_id = 71_339_i64;
+        let contract = [0x66_u8; 20];
+
+        sqlx::query("DELETE FROM indexed_blocks WHERE chain_id = $1")
+            .bind(chain_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO indexed_blocks
+                (chain_id, block_number, block_hash, parent_hash, block_timestamp)
+             VALUES ($1, 100, $2, $3, now())",
+        )
+        .bind(chain_id)
+        .bind(vec![0x30_u8; 32])
+        .bind(vec![0x2f_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let metadata = MarketMetadata {
+            question: "Will ETH be above $4,000 on August 22, 2026?".to_string(),
+            description: "A Base Sepolia demonstration prediction market for FORESYN.".to_string(),
+            resolution_criteria: "Resolves YES if the ETH/USD reference price is strictly above 4000 USD at the market deadline. Otherwise resolves NO.".to_string(),
+            category: "Crypto".to_string(),
+            source_url: None,
+        };
+        let computed_digest = metadata.compute_digest().unwrap();
+        let real_digest = computed_digest.to_vec();
+
+        // Market 1: on-chain digest, but no off-chain metadata row at all.
+        // Market 2: metadata whose digest matches what is on-chain.
+        // Market 3: metadata stored against a digest it does not hash to.
+        let wrong_digest = vec![0x99_u8; 32];
+        for (market_id, digest) in [
+            ("1", vec![0x77_u8; 32]),
+            ("2", real_digest.clone()),
+            ("3", wrong_digest.clone()),
+        ] {
+            sqlx::query(
+                "INSERT INTO markets
+                    (chain_id, contract_address, market_id, resolver, creator, deadline,
+                     metadata_digest, creation_block_number, creation_transaction_hash)
+                 VALUES ($1, $2, $3::numeric, $4, $5, 1787356800, $6, 100, $7)",
+            )
+            .bind(chain_id)
+            .bind(contract)
+            .bind(market_id)
+            .bind(vec![0x11_u8; 20])
+            .bind(vec![0x12_u8; 20])
+            .bind(&digest)
+            .bind(vec![0x13_u8; 32])
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        for market_id in ["2", "3"] {
+            sqlx::query(
+                "INSERT INTO market_metadata
+                    (chain_id, contract_address, market_id, question, description,
+                     resolution_criteria, category, source_url, metadata_digest)
+                 VALUES ($1, $2, $3::numeric, $4, $5, $6, $7, NULL, $8)",
+            )
+            .bind(chain_id)
+            .bind(contract)
+            .bind(market_id)
+            .bind(&metadata.question)
+            .bind(&metadata.description)
+            .bind(&metadata.resolution_criteria)
+            .bind(&metadata.category)
+            .bind(if market_id == "2" {
+                &real_digest
+            } else {
+                &wrong_digest
+            })
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let reader = PostgresMarketReader::from_pool(
+            pool.clone(),
+            u64::try_from(chain_id).unwrap(),
+            alloy::primitives::Address::from(contract),
+        )
+        .unwrap();
+        let application = app(Arc::new(reader));
+
+        let fetch = |id: &'static str| {
+            let application = application.clone();
+            async move {
+                let response = application
+                    .oneshot(
+                        Request::get(format!("/api/markets/{id}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                response_json(response).await
+            }
+        };
+
+        // A market with no off-chain metadata omits both fields entirely, so a
+        // client cannot mistake absence for an unverified or empty question.
+        let market_1 = fetch("1").await;
+        assert_eq!(
+            market_1["metadata_digest"],
+            format!("0x{}", "77".repeat(32))
+        );
+        assert!(market_1.get("metadata").is_none());
+        assert!(market_1.get("metadata_verified").is_none());
+
+        // Matching metadata is returned and marked verified.
+        let market_2 = fetch("2").await;
+        assert_eq!(market_2["metadata_verified"], serde_json::Value::Bool(true));
+        assert_eq!(
+            market_2["metadata"]["question"],
+            "Will ETH be above $4,000 on August 22, 2026?"
+        );
+        assert_eq!(market_2["metadata"]["category"], "Crypto");
+        assert_eq!(
+            market_2["metadata_digest"],
+            format!("{computed_digest:?}"),
+            "the API must echo the same digest the metadata hashes to"
+        );
+        // source_url is absent rather than null in the API response.
+        assert!(market_2["metadata"].get("source_url").is_none());
+
+        // Mismatched metadata is surfaced but explicitly flagged unverified.
+        let market_3 = fetch("3").await;
+        assert_eq!(
+            market_3["metadata_verified"],
+            serde_json::Value::Bool(false)
+        );
+        assert!(market_3.get("metadata").is_some());
+
+        sqlx::query("DELETE FROM indexed_blocks WHERE chain_id = $1")
+            .bind(chain_id)
             .execute(&pool)
             .await
             .unwrap();

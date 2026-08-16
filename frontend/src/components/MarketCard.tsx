@@ -9,8 +9,9 @@ interface MarketCardProps {
 }
 
 export function MarketCard({ market, selected, disabled = false, onSelect }: MarketCardProps) {
-  const hasMetadata = market.metadata && market.metadata_verified
-  const displayTitle = hasMetadata ? market.metadata.question : `Market #${market.market_id}`
+  // Show the question only when its digest matches the on-chain commitment;
+  // otherwise fall back to the technical label.
+  const verifiedMetadata = market.metadata_verified ? market.metadata : undefined
 
   return (
     <button
@@ -21,10 +22,10 @@ export function MarketCard({ market, selected, disabled = false, onSelect }: Mar
       disabled={disabled}
     >
       <span className="market-card__title">
-        {displayTitle}
+        {verifiedMetadata ? verifiedMetadata.question : `Market #${market.market_id}`}
       </span>
 
-      {hasMetadata && (
+      {verifiedMetadata && (
         <span className="market-number-label">Market #{market.market_id}</span>
       )}
 

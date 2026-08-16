@@ -1,3 +1,13 @@
+/** Human-readable market description held off-chain and committed on-chain by digest. */
+export interface MarketMetadata {
+  question: string
+  description: string
+  resolution_criteria: string
+  category: string
+  /** Omitted by the API when the market has no source link. */
+  source_url?: string | null
+}
+
 export interface Market {
   market_id: string
   resolver: string
@@ -8,13 +18,9 @@ export interface Market {
   yes_pool: string
   no_pool: string
   total_pool: string
-  metadata?: {
-    question: string
-    description: string
-    resolution_criteria: string
-    category: string
-    source_url: string | null
-  }
+  /** Absent when no off-chain metadata is recorded for this market. */
+  metadata?: MarketMetadata
+  /** Whether `metadata` re-hashes to `metadata_digest`. Absent with `metadata`. */
   metadata_verified?: boolean
 }
 
