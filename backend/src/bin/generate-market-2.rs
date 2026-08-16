@@ -137,14 +137,14 @@ fn main() -> ExitCode {
     println!("      metadata_digest");
     println!("  ) VALUES (");
     println!("      {CHAIN_ID},");
-    println!("      '\\x{:x}',", contract);
+    println!("      '\\x{contract:x}',");
     println!("      <market-id-from-event>,");
     println!("      {},", sql_quote(&metadata.question));
     println!("      {},", sql_quote(&metadata.description));
     println!("      {},", sql_quote(&metadata.resolution_criteria));
     println!("      {},", sql_quote(&metadata.category));
     println!("      NULL,");
-    println!("      '\\x{:x}'", digest);
+    println!("      '\\x{digest:x}'");
     println!("  );");
     println!();
 
