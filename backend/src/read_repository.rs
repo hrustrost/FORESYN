@@ -2,8 +2,11 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use thiserror::Error;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+use crate::metadata::MarketMetadata;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketReadModel {
     pub market_id: String,
     pub resolver: String,
@@ -14,6 +17,10 @@ pub struct MarketReadModel {
     pub yes_pool: String,
     pub no_pool: String,
     pub total_pool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<MarketMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_verified: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,12 +110,21 @@ impl MarketReader for PostgresMarketReader {
                 m.creation_block_number,
                 COALESCE(s.yes_pool, 0)::text AS yes_pool,
                 COALESCE(s.no_pool, 0)::text AS no_pool,
-                (COALESCE(s.yes_pool, 0) + COALESCE(s.no_pool, 0))::text AS total_pool
+                (COALESCE(s.yes_pool, 0) + COALESCE(s.no_pool, 0))::text AS total_pool,
+                mm.question,
+                mm.description,
+                mm.resolution_criteria,
+                mm.category,
+                mm.source_url
              FROM markets m
              LEFT JOIN market_states s
                ON s.chain_id = m.chain_id
               AND s.contract_address = m.contract_address
               AND s.market_id = m.market_id
+             LEFT JOIN market_metadata mm
+               ON mm.chain_id = m.chain_id
+              AND mm.contract_address = m.contract_address
+              AND mm.market_id = m.market_id
              WHERE m.chain_id = $1 AND m.contract_address = $2
              ORDER BY m.market_id DESC
              LIMIT $3 OFFSET $4",
@@ -134,12 +150,21 @@ impl MarketReader for PostgresMarketReader {
                 m.creation_block_number,
                 COALESCE(s.yes_pool, 0)::text AS yes_pool,
                 COALESCE(s.no_pool, 0)::text AS no_pool,
-                (COALESCE(s.yes_pool, 0) + COALESCE(s.no_pool, 0))::text AS total_pool
+                (COALESCE(s.yes_pool, 0) + COALESCE(s.no_pool, 0))::text AS total_pool,
+                mm.question,
+                mm.description,
+                mm.resolution_criteria,
+                mm.category,
+                mm.source_url
              FROM markets m
              LEFT JOIN market_states s
                ON s.chain_id = m.chain_id
               AND s.contract_address = m.contract_address
               AND s.market_id = m.market_id
+             LEFT JOIN market_metadata mm
+               ON mm.chain_id = m.chain_id
+              AND mm.contract_address = m.contract_address
+              AND mm.market_id = m.market_id
              WHERE m.chain_id = $1
                AND m.contract_address = $2
                AND m.market_id = $3::numeric",
@@ -178,16 +203,53 @@ impl MarketReader for PostgresMarketReader {
 }
 
 fn market_from_row(row: &sqlx::postgres::PgRow) -> Result<MarketReadModel, ReadError> {
+    let metadata_digest_hex = prefixed_hex(
+        "metadata_digest",
+        &row.try_get::<Vec<u8>, _>("metadata_digest")?,
+        32,
+    )?;
+
+    // Parse metadata from row if all fields are present
+    let (metadata, metadata_verified) = if let (Ok(question), Ok(description), Ok(resolution_criteria), Ok(category)) = (
+        row.try_get::<Option<String>, _>("question"),
+        row.try_get::<Option<String>, _>("description"),
+        row.try_get::<Option<String>, _>("resolution_criteria"),
+        row.try_get::<Option<String>, _>("category"),
+    ) {
+        match (question, description, resolution_criteria, category) {
+            (Some(q), Some(d), Some(rc), Some(cat)) => {
+                let source_url: Option<String> = row.try_get("source_url").unwrap_or(None);
+                let metadata_obj = MarketMetadata {
+                    question: q,
+                    description: d,
+                    resolution_criteria: rc,
+                    category: cat,
+                    source_url,
+                };
+
+                // Verify digest matches
+                let on_chain_digest_hex = metadata_digest_hex.trim_start_matches("0x");
+                let verified = if let Ok(digest) = metadata_obj.compute_digest() {
+                    let computed_hex = format!("{:x}", digest);
+                    computed_hex == on_chain_digest_hex
+                } else {
+                    false
+                };
+
+                (Some(metadata_obj), Some(verified))
+            }
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
     Ok(MarketReadModel {
         market_id: row.try_get("market_id")?,
         resolver: prefixed_hex("resolver", &row.try_get::<Vec<u8>, _>("resolver")?, 20)?,
         creator: prefixed_hex("creator", &row.try_get::<Vec<u8>, _>("creator")?, 20)?,
         deadline: row.try_get("deadline")?,
-        metadata_digest: prefixed_hex(
-            "metadata_digest",
-            &row.try_get::<Vec<u8>, _>("metadata_digest")?,
-            32,
-        )?,
+        metadata_digest: metadata_digest_hex,
         creation_block_number: non_negative_i64_string(
             "creation_block_number",
             row.try_get("creation_block_number")?,
@@ -195,6 +257,8 @@ fn market_from_row(row: &sqlx::postgres::PgRow) -> Result<MarketReadModel, ReadE
         yes_pool: row.try_get("yes_pool")?,
         no_pool: row.try_get("no_pool")?,
         total_pool: row.try_get("total_pool")?,
+        metadata,
+        metadata_verified,
     })
 }
 

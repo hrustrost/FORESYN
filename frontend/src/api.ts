@@ -8,6 +8,14 @@ export interface Market {
   yes_pool: string
   no_pool: string
   total_pool: string
+  metadata?: {
+    question: string
+    description: string
+    resolution_criteria: string
+    category: string
+    source_url: string | null
+  }
+  metadata_verified?: boolean
 }
 
 export interface Position {

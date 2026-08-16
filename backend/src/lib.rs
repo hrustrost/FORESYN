@@ -4,4 +4,6 @@ pub mod config;
 pub mod contracts;
 pub mod db;
 pub mod indexer;
+pub mod metadata;
+pub mod metadata_repository;
 pub mod read_repository;

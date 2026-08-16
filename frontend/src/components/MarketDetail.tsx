@@ -11,15 +11,51 @@ interface MarketDetailProps {
 }
 
 export function MarketDetail({ market, positions, actions }: MarketDetailProps) {
+  const hasVerifiedMetadata = market.metadata && market.metadata_verified
+
   return (
     <article className="market-detail" aria-labelledby="detail-heading">
       <header className="market-detail__header">
         <div>
-          <p className="eyebrow">On-chain market</p>
-          <h2 id="detail-heading">Market #{market.market_id}</h2>
+          {hasVerifiedMetadata && market.metadata ? (
+            <>
+              <h2 id="detail-heading" className="market-detail__question">
+                {market.metadata.question}
+              </h2>
+              <p className="eyebrow">Market #{market.market_id}</p>
+            </>
+          ) : (
+            <>
+              <p className="eyebrow">On-chain market</p>
+              <h2 id="detail-heading">Market #{market.market_id}</h2>
+              {!market.metadata && (
+                <p className="market-detail__unavailable">Metadata unavailable</p>
+              )}
+            </>
+          )}
         </div>
-        <div className="readonly-pill">Indexed view</div>
+        <div className="status-badges">
+          {hasVerifiedMetadata && (
+            <div className="verified-badge">VERIFIED METADATA</div>
+          )}
+          <div className="readonly-pill">Indexed view</div>
+        </div>
       </header>
+
+      {hasVerifiedMetadata && market.metadata && (
+        <section className="market-detail__metadata">
+          <p className="metadata-description">
+            {market.metadata.description}
+          </p>
+          <div className="resolution-criteria">
+            <dt>Resolution criteria</dt>
+            <dd>{market.metadata.resolution_criteria}</dd>
+          </div>
+          <div className="metadata-category">
+            <span className="category-badge">{market.metadata.category}</span>
+          </div>
+        </section>
+      )}
 
       <dl className="market-metadata">
         <div>

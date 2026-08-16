@@ -13,7 +13,10 @@ use thiserror::Error;
 use tower_http::cors::CorsLayer;
 use tracing::error;
 
-use crate::read_repository::{MarketReadModel, MarketReader, PositionReadModel, ReadError};
+use crate::{
+    metadata::MarketMetadata,
+    read_repository::{MarketReadModel, MarketReader, PositionReadModel, ReadError},
+};
 
 const DEFAULT_LIMIT: u32 = 20;
 const MAX_LIMIT: u32 = 100;
@@ -66,6 +69,10 @@ pub struct MarketResponse {
     pub yes_pool: String,
     pub no_pool: String,
     pub total_pool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<MarketMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_verified: Option<bool>,
 }
 
 impl From<MarketReadModel> for MarketResponse {
@@ -80,6 +87,8 @@ impl From<MarketReadModel> for MarketResponse {
             yes_pool: value.yes_pool,
             no_pool: value.no_pool,
             total_pool: value.total_pool,
+            metadata: value.metadata,
+            metadata_verified: value.metadata_verified,
         }
     }
 }

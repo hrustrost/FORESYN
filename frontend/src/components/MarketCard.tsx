@@ -9,6 +9,9 @@ interface MarketCardProps {
 }
 
 export function MarketCard({ market, selected, disabled = false, onSelect }: MarketCardProps) {
+  const hasMetadata = market.metadata && market.metadata_verified
+  const displayTitle = hasMetadata ? market.metadata.question : `Market #${market.market_id}`
+
   return (
     <button
       className={`market-card${selected ? ' market-card--selected' : ''}`}
@@ -17,10 +20,13 @@ export function MarketCard({ market, selected, disabled = false, onSelect }: Mar
       aria-pressed={selected}
       disabled={disabled}
     >
-      <span className="market-card__topline">
-        <span className="market-number">Market #{market.market_id}</span>
-        <span className="block-number">Block {market.creation_block_number}</span>
+      <span className="market-card__title">
+        {displayTitle}
       </span>
+
+      {hasMetadata && (
+        <span className="market-number-label">Market #{market.market_id}</span>
+      )}
 
       <span className="market-card__resolver">
         Resolver
